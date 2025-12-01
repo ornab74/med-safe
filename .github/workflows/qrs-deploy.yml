@@ -9,8 +9,8 @@ on:
 jobs:
   build-and-upload:
     runs-on: ubuntu-latest
-    environment: playstore  # Protects secrets
-    timeout-minutes: 75     # Optimized for Docker
+    environment: playstore
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code
@@ -18,23 +18,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cache Docker layers (multi-layer optimization)
-        uses: actions/cache@v4
-        id: docker-cache
-        with:
-          path: /tmp/.buildx-cache  # Speeds up container pulls
-          key: docker-kivy-${{ runner.os }}-v1
-          restore-keys: docker-kivy-${{ runner.os }}-
+      - name: Free up disk space (optional but recommended)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: Cache global Buildozer tools (SDK/NDK)
+      - name: Cache project .buildozer directory
         uses: actions/cache@v4
-        id: global-cache
         with:
-          path: ~/.buildozer-global  # Caches SDK/NDK across runs
-          key: buildozer-global-${{ runner.os }}-r28c-v2  # Locks to r28c
-          restore-keys: buildozer-global-${{ runner.os }}-
+          path: .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v29
+          restore-keys: |
+            buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-
+            buildozer-${{ runner.os }}-
 
-      - name: Encrypt model (pre-build)
+      - name: Encrypt model
         env:
           ENC_KEY: ${{ secrets.QRS_ENC_KEY }}
         run: |
@@ -42,7 +42,7 @@ jobs:
           curl -L -o models/model.gguf \
             https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
           echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          python3 -c "
+          python3 - <<'PY'
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
           import os, secrets
           key = bytes.fromhex(os.environ['ENC_KEY'])
@@ -50,58 +50,45 @@ jobs:
           nonce = secrets.token_bytes(12)
           ct = nonce + AESGCM(key).encrypt(nonce, data, None)
           open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
-          "
+          PY
           rm -f models/model.gguf
 
-      - name: Cache project-specific .buildozer (pre-build)
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v27  # Bumped for stability
-
-      - name: Build with Official Kivy Buildozer Docker (no buggy action)
-        id: build
+      - name: Build AAB using official Kivy Buildozer Docker (2025 working)
         run: |
-          # Pull & run official image: mounts workspace, runs release (no chown issues)
-          docker pull kivy/buildozer:1.5.0
           docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -w /workspace \
-            -e BOOTSTRAP=openssl \
-            kivy/buildozer:1.5.0 \
+            -v "$(pwd)":/home/user/hostcwd \
+            -w /home/user/hostcwd \
+            ghcr.io/kivy/buildozer:latest \
             buildozer -v android release
-          # Output AAB path
-          echo "filename=bin/qrs-7.7.7-release.aab" >> $GITHUB_OUTPUT
 
-      - name: Cache project-specific .buildozer (post-build)
-        if: success()
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v27  # Syncs changes
-
-      - name: Verify AAB (integrity check)
+      - name: Find generated AAB
+        id: find_aab
         run: |
-          AAB="${{ steps.build.outputs.filename }}"
-          if [ ! -f "$AAB" ]; then
-            echo "AAB missing, checking bin/*.aab"
+          AAB=$(ls bin/*.aab 2>/dev/null | head -1)
+          if [ -z "$AAB" ]; then
+            echo "No AAB found in bin/"
             ls -la bin/
             exit 1
           fi
-          aapt dump badging "$AAB" | head -20  # Quick package verification
-          echo "AAB verified successfully"
+          echo "AAB found: $AAB"
+          echo "aab_path=$AAB" >> $GITHUB_OUTPUT
 
-      - name: Upload AAB artifact
+      - name: Verify AAB
+        run: |
+          aapt dump badging "${{ steps.find_aab.outputs.aab_path }}" | head -20
+          echo "AAB is valid"
+
+      - name: Upload AAB as artifact
         uses: actions/upload-artifact@v4
         with:
           name: qrs-release-aab
-          path: ${{ steps.build.outputs.filename }}
+          path: ${{ steps.find_aab.outputs.aab_path }}
 
-      - name: Upload to Google Play Internal
+      - name: Upload to Google Play Internal Testing
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
           packageName: com.chaosresonance.qrs
-          releaseFiles: ${{ steps.build.outputs.filename }}
+          releaseFiles: ${{ steps.find_aab.outputs.aab_path }}
           track: internal
           status: completed

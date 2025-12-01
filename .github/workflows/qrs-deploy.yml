@@ -20,38 +20,48 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install system dependencies + cryptography early
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jdk-headless autoconf automake cmake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 libffi-dev libssl-dev libltdl-dev
+          sudo apt-get install -y --no-install-recommends \
+            openjdk-17-jdk-headless cmake libtool libltdl-dev autoconf automake pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 libffi-dev libssl-dev \
+            build-essential git zip unzip lld clang
+
+          # THIS IS THE CRUCIAL LINE — install cryptography globally before anything else
+          pip install --user cryptography==42.0.8
 
       - name: Install Buildozer
         run: |
+          pip install --user --upgrade pip
           pip install --user buildozer==1.5.0 cython==0.29.36
 
-      - name: Download + encrypt model
+      - name: Download + encrypt model (now works)
         env:
-          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}  # 64-char hex
+          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}  # 64-char hex string in repo secrets
         run: |
           mkdir -p models
-          curl -L -o models/model.gguf https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
+          curl -L -o models/model.gguf \
+            https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
           echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          python3 -c "
+          
+          python3 - <<'PY'
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-          import os
-          key = bytes.fromhex('$ENC_KEY')
-          data = open('models/model.gguf','rb').read()
+          import os, sys
+          key = bytes.fromhex(os.environ['ENC_KEY'])
+          data = open('models/model.gguf', 'rb').read()
           nonce = os.urandom(12)
           ct = nonce + AESGCM(key).encrypt(nonce, data, None)
-          open('models/llama3-small-Q3_K_M.gguf.aes','wb').write(ct)
-          "
+          open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
+          print("Model encrypted successfully")
+          PY
           rm models/model.gguf
 
       - name: Cache Buildozer
         uses: actions/cache@v4
         with:
           path: .buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v14
 
       - name: Build Release AAB
         run: |

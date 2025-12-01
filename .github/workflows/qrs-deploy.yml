@@ -29,14 +29,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-global-${{ runner.os }}-v34
+          key: buildozer-global-${{ runner.os }}-v35
           restore-keys: buildozer-global-${{ runner.os }}-
 
       - name: Cache project .buildozer directory
         uses: actions/cache@v4
         with:
           path: .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v34
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v35
           restore-keys: |
             buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-
             buildozer-${{ runner.os }}-
@@ -60,15 +60,16 @@ jobs:
           PY
           rm -f models/model.gguf
 
-      - name: Build AAB using official Kivy Buildozer Docker (bypassed root prompt)
+      - name: Build AAB using official Kivy Buildozer Docker (fixed bash invocation + root prompt)
         run: |
           echo y | docker run --rm \
+            --entrypoint /bin/bash \
             -v "$HOME/.buildozer":/home/user/.buildozer \
             -v "$(pwd)":/home/user/hostcwd \
             -w /home/user/hostcwd \
             -i \
             ghcr.io/kivy/buildozer:latest \
-            buildozer -v android release
+            -c "buildozer -v android release"
 
       - name: Find generated AAB
         id: find_aab

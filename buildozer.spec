@@ -27,9 +27,17 @@ android.archs = arm64-v8a, armeabi-v7a
 
 android.permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC
 
-p4a.branch = stable
+# Fixed: Use develop branch for AAB support (required for p4a with AAB)
+p4a.branch = develop
+p4a.patch_ignore_errors = True
+p4a.setup_py_ignore_patch_errors = True
 android.accept_sdk_license = True
+android.private_storage = False
+android.allow_backup = False
+android.extra_args = --enable-preview --ignore-setup-py-errors
+
 log_level = 2
+android.logcat_filters = *:S python:D
 
 [buildozer]
 log_level = 2

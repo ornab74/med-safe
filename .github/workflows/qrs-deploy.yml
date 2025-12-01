@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jdk-headless autoconf automake cmake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev libltdl-dev
+          sudo apt-get install -y openjdk-17-jdk-headless autoconf automake cmake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 libffi-dev libssl-dev libltdl-dev
 
       - name: Install Buildozer
         run: |

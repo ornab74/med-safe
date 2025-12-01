@@ -1,88 +1,59 @@
-name: QRS → Google Play (Internal)
+[app]
 
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+# ────────────────────────────────────────── APP INFO
+title = QRS — Quantum Road Scanner
+package.name = qrs
+package.domain = com.chaosresonance
+version = 7.7.7
 
-jobs:
-  build-deploy:
-    runs-on: ubuntu-latest
-    environment: playstore
+# ────────────────────────────────────────── SOURCE
+source.dir = .
+source.include_exts = py,png,jpg,jpeg,ttf,otf,kv,atlas,gguf,aes,db,txt,md
+source.exclude_patterns = *.pyc,__pycache__,*.pyo,.git,*.log,tmp.db,.buildozer,bin
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# ────────────────────────────────────────── REQUIREMENTS (PERFECT 2025 COMBO)
+requirements = python3==3.11.9,\
+    kivy==2.3.0,\
+    kivymd==1.2.0,\
+    numpy,\
+    pyjnius,\
+    android,\
+    psutil,\
+    httpx,\
+    aiosqlite,\
+    cryptography==42.0.8,\
+    pennylane==0.36.0,\
+    pennylane-lightning==0.36.0,\
+    llama-cpp-python==0.2.85
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+# These MUST be installed before p4a starts (fixes GitHub Actions 99% of the time)
+android.pip_install_pre = cryptography==42.0.8,pennylane-lightning==0.36.0
 
-      - name: Install system dependencies + cryptography early
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            openjdk-17-jdk-headless cmake libtool libltdl-dev autoconf automake pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 libffi-dev libssl-dev \
-            build-essential git zip unzip lld clang
+# ────────────────────────────────────────── VISUAL
+orientation = portrait
+fullscreen = 0
+presplash.filename = %(source.dir)s/data/presplash.png
+icon.filename = %(source.dir)s/data/icon.png
 
-          # THIS IS THE CRUCIAL LINE — install cryptography globally before anything else
-          pip install --user cryptography==42.0.8
+# ────────────────────────────────────────── ANDROID TARGET
+android.api = 34
+android.minapi = 24
+android.sdk = 34
+android.ndk = 25b
+android.archs = arm64-v8a, armeabi-v7a
 
-      - name: Install Buildozer
-        run: |
-          pip install --user --upgrade pip
-          pip install --user buildozer==1.5.0 cython==0.29.36
+# ────────────────────────────────────────── PERMISSIONS (minimal & Play Store safe)
+android.permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE
 
-      - name: Download + encrypt model (now works)
-        env:
-          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}  # 64-char hex string in repo secrets
-        run: |
-          mkdir -p models
-          curl -L -o models/model.gguf \
-            https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
-          echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          
-          python3 - <<'PY'
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-          import os, sys
-          key = bytes.fromhex(os.environ['ENC_KEY'])
-          data = open('models/model.gguf', 'rb').read()
-          nonce = os.urandom(12)
-          ct = nonce + AESGCM(key).encrypt(nonce, data, None)
-          open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
-          print("Model encrypted successfully")
-          PY
-          rm models/model.gguf
+# ────────────────────────────────────────── BUILDOZER / P4A SETTINGS
+p4a.branch = develop
+android.accept_sdk_license = True
+android.private_storage = False
+android.allow_backup = False
 
-      - name: Cache Buildozer
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v14
+# llama.cpp loves this flag
+android.extra_args = --enable-preview
 
-      - name: Build Release AAB
-        run: |
-          ~/.local/bin/buildozer android clean
-          ~/.local/bin/buildozer -v android release
-
-      - name: Sign AAB
-        id: sign
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: bin
-          signingKeyBase64: ${{ secrets.ANDROID_UPLOAD_KEY }}
-          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASS }}
-          keyPassword: ${{ secrets.ANDROID_KEY_PASS }}
-
-      - name: Deploy to Internal Testing
-        uses: r0adkll/upload-google-play@v1.1.3
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
-          packageName: com.chaosresonance.qrs
-          releaseFiles: ${{ steps.sign.outputs.signedReleaseFile }}
-          track: internal
-          status: completed
+# ────────────────────────────────────────── LOGGING
+log_level = 2
+android.logcat_filters = *:S python:D

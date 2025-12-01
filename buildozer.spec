@@ -30,6 +30,8 @@ android.permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREG
 p4a.branch = develop
 p4a.patch_ignore_errors = True
 p4a.setup_py_ignore_patch_errors = True
+# Fixed: Ignore failed patches (e.g., 3.14_armv7l_fix for Python 3.11.9)
+p4a.extra_args = --ignore-patch-errors
 android.accept_sdk_license = True
 android.private_storage = False
 android.allow_backup = False

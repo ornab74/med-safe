@@ -35,13 +35,13 @@ icon.filename = %(source.dir)s/data/icon.png
 android.api = 35
 android.minapi = 24
 android.sdk = 35
-android.ndk = 28c  # Locked to LTS; action handles fallback
+android.ndk = 28c
 android.release_artifact = aab
 android.archs = arm64-v8a, armeabi-v7a
 
 android.permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC
 
-p4a.branch = stable  # 2025 stable avoids develop patch bugs
+p4a.branch = stable
 p4a.patch_ignore_errors = True
 p4a.setup_py_ignore_patch_errors = True
 android.accept_sdk_license = True

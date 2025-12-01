@@ -10,10 +10,13 @@ jobs:
   build-deploy:
     runs-on: ubuntu-latest
     environment: playstore
+    timeout-minutes: 60  # Increased for large builds
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # For tag-based versioning
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -37,6 +40,8 @@ jobs:
             libtinfo6 \
             libffi-dev \
             libssl-dev \
+            libgmp3-dev \
+            python3-dev \
             build-essential \
             git \
             zip \
@@ -48,7 +53,7 @@ jobs:
       - name: Install Buildozer
         run: |
           pip install --user --upgrade pip
-          pip install --user buildozer==1.5.0 cython==0.29.36
+          pip install --user buildozer==1.6.0 cython==0.29.36
 
       - name: Download & encrypt model
         env:
@@ -74,11 +79,37 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v16
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v17  # Bumped key for spec changes
 
-      - name: Build Release AAB (no clean!)
+      - name: Cache Android NDK r27c (fixes download errors)
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform/android-ndk-r27c
+          key: ndk-r27c-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+
+      - name: Pre-download NDK if cache miss
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O ndk.zip
+          mkdir -p ~/.buildozer/android/platform/
+          unzip -q ndk.zip -d ~/.buildozer/android/platform/
+          mv android-ndk-r27c ~/.buildozer/android/platform/
+          rm ndk.zip
+        env:
+          ANDROID_NDK_HOME: ~/.buildozer/android/platform/android-ndk-r27c
+
+      - name: Build Release AAB
+        run: |
+          ~/.local/bin/buildozer android clean  # Safe clean for reproducibility
+          export ANDROID_NDK_HOME=~/.buildozer/android/platform/android-ndk-r27c
           ~/.local/bin/buildozer -v android release
+
+      - name: Upload AAB artifact (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qrs-aab
+          path: bin/*.aab
 
       - name: Sign AAB
         id: sign
@@ -93,8 +124,10 @@ jobs:
       - name: Upload to Google Play Internal Testing
         uses: r0adkll/upload-google-play@v1.1.3
         with:
-          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          serviceAccountJson: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}  # Use 'json' (not plainText) for security
           packageName: com.chaosresonance.qrs
           releaseFiles: ${{ steps.sign.outputs.signedReleaseFile }}
           track: internal
           status: completed
+          # Optional: Auto-version from tag (e.g., v1.2.3 → version 10203)
+          versionCode: ${{ github.ref_type == 'tag' && format('1{0,number,00}{1,number,00}', github.ref_name.split('.')[0], github.ref_name.split('.')[1]) || '777' }}

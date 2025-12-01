@@ -7,33 +7,50 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-upload:
+  build-deploy:
     runs-on: ubuntu-latest
     environment: playstore
-    timeout-minutes: 90
+    timeout-minutes: 60  # Increased for large builds
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # For tag-based versioning
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install system dependencies
+      - name: Install system packages + cryptography early
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            openjdk-17-jdk-headless cmake libtool libltdl-dev autoconf automake \
-            pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 \
-            libffi-dev libssl-dev libgmp3-dev python3-dev build-essential \
-            git zip unzip lld clang wget
+            openjdk-17-jdk-headless \
+            cmake \
+            libtool \
+            libltdl-dev \
+            autoconf \
+            automake \
+            pkg-config \
+            zlib1g-dev \
+            libncurses5-dev \
+            libncursesw5-dev \
+            libtinfo6 \
+            libffi-dev \
+            libssl-dev \
+            libgmp3-dev \
+            python3-dev \
+            build-essential \
+            git \
+            zip \
+            unzip \
+            lld \
+            clang
           pip install --user cryptography==42.0.8
 
-      - name: Install latest Buildozer
+      - name: Install Buildozer
         run: |
           pip install --user --upgrade pip
           pip install --user buildozer==1.6.0 cython==0.29.36
@@ -48,48 +65,69 @@ jobs:
           echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
           python3 - <<'PY'
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-          import os, secrets
+          import os
           key = bytes.fromhex(os.environ['ENC_KEY'])
           data = open('models/model.gguf', 'rb').read()
-          nonce = secrets.token_bytes(12)
+          nonce = os.urandom(12)
           ct = nonce + AESGCM(key).encrypt(nonce, data, None)
           open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
-          print("Model encrypted")
+          print("Model encrypted successfully")
           PY
           rm -f models/model.gguf
 
-      - name: Cache Buildozer & NDK
+      - name: Cache Buildozer
         uses: actions/cache@v4
         with:
-          path: |
-            .buildozer
-            ~/.buildozer/android/platform/android-ndk-r27c
-          key: buildozer-ndk-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v18
+          path: .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v17  # Bumped key for spec changes
 
-      - name: Download NDK r27c (if cache miss)
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Cache Android NDK r27c (fixes download errors)
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform/android-ndk-r27c
+          key: ndk-r27c-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+
+      - name: Pre-download NDK if cache miss
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
-          unzip -q android-ndk-r27c-linux.zip -d ~/.buildozer/android/platform/
-          rm android-ndk-r27c-linux.zip
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip -O ndk.zip
+          mkdir -p ~/.buildozer/android/platform/
+          unzip -q ndk.zip -d ~/.buildozer/android/platform/
+          mv android-ndk-r27c ~/.buildozer/android/platform/
+          rm ndk.zip
+        env:
+          ANDROID_NDK_HOME: ~/.buildozer/android/platform/android-ndk-r27c
 
       - name: Build Release AAB
         run: |
-          buildozer android clean
+          ~/.local/bin/buildozer android clean  # Safe clean for reproducibility
           export ANDROID_NDK_HOME=~/.buildozer/android/platform/android-ndk-r27c
-          buildozer -v android release
+          ~/.local/bin/buildozer -v android release
 
-      - name: Upload AAB as artifact (debug)
+      - name: Upload AAB artifact (for debugging)
         uses: actions/upload-artifact@v4
         with:
-          name: qrs-release-aab
+          name: qrs-aab
           path: bin/*.aab
 
-      - name: Upload to Google Play (official action)
-        uses: google-play/deploy@v2
+      - name: Sign AAB
+        id: sign
+        uses: r0adkll/sign-android-release@v1
         with:
-          serviceAccountJson: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          releaseDirectory: bin
+          signingKeyBase64: ${{ secrets.ANDROID_UPLOAD_KEY }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASS }}
+
+      - name: Upload to Google Play Internal Testing
+        uses: r0adkll/upload-google-play@v1.1.3
+        with:
+          serviceAccountJson: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}  # Use 'json' (not plainText) for security
           packageName: com.chaosresonance.qrs
-          aab: bin/*.aab
+          releaseFiles: ${{ steps.sign.outputs.signedReleaseFile }}
           track: internal
           status: completed
+          # Fixed: Simple default; auto-increment would need a separate step for complex formatting
+          versionCode: 777

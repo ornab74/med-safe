@@ -1,0 +1,78 @@
+name: QRS → Google Play (Internal)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment: playstore
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk-headless autoconf automake cmake libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev libltdl-dev
+
+      - name: Install Buildozer
+        run: |
+          pip install --user buildozer==1.5.0 cython==0.29.36
+
+      - name: Download + encrypt model
+        env:
+          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}  # 64-char hex
+        run: |
+          mkdir -p models
+          curl -L -o models/model.gguf https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
+          echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
+          python3 -c "
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          import os
+          key = bytes.fromhex('$ENC_KEY')
+          data = open('models/model.gguf','rb').read()
+          nonce = os.urandom(12)
+          ct = nonce + AESGCM(key).encrypt(nonce, data, None)
+          open('models/llama3-small-Q3_K_M.gguf.aes','wb').write(ct)
+          "
+          rm models/model.gguf
+
+      - name: Cache Buildozer
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+
+      - name: Build Release AAB
+        run: |
+          ~/.local/bin/buildozer android clean
+          ~/.local/bin/buildozer -v android release
+
+      - name: Sign AAB
+        id: sign
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: bin
+          signingKeyBase64: ${{ secrets.ANDROID_UPLOAD_KEY }}
+          alias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASS }}
+
+      - name: Deploy to Internal Testing
+        uses: r0adkll/upload-google-play@v1.1.3
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
+          packageName: com.chaosresonance.qrs
+          releaseFiles: ${{ steps.sign.outputs.signedReleaseFile }}
+          track: internal
+          status: completed

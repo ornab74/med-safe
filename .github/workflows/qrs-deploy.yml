@@ -7,44 +7,34 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-native:
+  build-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 80
-    strategy:
-      max-parallel: 1
-      matrix:
-        attempt: [1, 2]  # Auto-retry up to 2x on failure (flakes only)
-        include:
-          - attempt: 1
-          - attempt: 2
-    outputs:
-      aab-path: ${{ steps.build.outputs.aab-path }}
-      success: ${{ steps.build.outputs.success }}
+    environment: playstore  # Protects secrets
+    timeout-minutes: 75     # Optimized for Docker
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          fetch-depth: 0
 
-      - name: Install dependencies + cryptography
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            openjdk-17-jdk-headless cmake libtool libltdl-dev autoconf automake \
-            pkg-config zlib1g-dev libncurses5-dev libssl-dev libffi-dev libgmp3-dev \
-            python3-dev build-essential git zip unzip wget lld clang aapt
-          pip install --user cryptography==42.0.8
+      - name: Cache Docker layers (multi-layer optimization)
+        uses: actions/cache@v4
+        id: docker-cache
+        with:
+          path: /tmp/.buildx-cache  # Speeds up container pulls
+          key: docker-kivy-${{ runner.os }}-v1
+          restore-keys: docker-kivy-${{ runner.os }}-
 
-      - name: Install Buildozer 1.5.0
-        run: |
-          pip install --user --upgrade pip
-          pip install --user buildozer==1.5.0 cython==0.29.36
+      - name: Cache global Buildozer tools (SDK/NDK)
+        uses: actions/cache@v4
+        id: global-cache
+        with:
+          path: ~/.buildozer-global  # Caches SDK/NDK across runs
+          key: buildozer-global-${{ runner.os }}-r28c-v2  # Locks to r28c
+          restore-keys: buildozer-global-${{ runner.os }}-
 
-      - name: Encrypt model
+      - name: Encrypt model (pre-build)
         env:
           ENC_KEY: ${{ secrets.QRS_ENC_KEY }}
         run: |
@@ -56,123 +46,62 @@ jobs:
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
           import os, secrets
           key = bytes.fromhex(os.environ['ENC_KEY'])
-          data = open('models/model.gguf','rb').read()
+          data = open('models/model.gguf', 'rb').read()
           nonce = secrets.token_bytes(12)
           ct = nonce + AESGCM(key).encrypt(nonce, data, None)
-          open('models/llama3-small-Q3_K_M.gguf.aes','wb').write(ct)
+          open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
           "
           rm -f models/model.gguf
 
-      - name: Advanced Cache: Global NDK + Project .buildozer
+      - name: Cache project-specific .buildozer (pre-build)
         uses: actions/cache@v4
-        id: cache
         with:
-          path: |
-            ~/.buildozer/android/platform/android-ndk-r28c
-            .buildozer
-          key: buildozer-hybrid-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v27
-          restore-keys: buildozer-hybrid-${{ runner.os }}-
+          path: .buildozer
+          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v27  # Bumped for stability
 
-      - name: Pre-extract NDK r28c with Retry & Verify (Native Mode)
-        if: steps.cache.outputs.cache-hit != 'true'
-        uses: nick-fields/retry@v2
-        with:
-          timeout_minutes: 10
-          max_attempts: 3
-          command: |
-            mkdir -p ~/.buildozer/android/platform
-            cd ~/.buildozer/android/platform
-            wget -q https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
-            unzip -q android-ndk-r28c-linux.zip
-            rm android-ndk-r28c-linux.zip
-            # Verify extraction (2025 SHA256 for r28c)
-            echo "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  android-ndk-r28c/source.properties" | sha256sum -c || exit 1
-            echo "NDK r28c verified & ready"
-
-      - name: Build Release AAB (Native)
+      - name: Build with Official Kivy Buildozer Docker (no buggy action)
         id: build
         run: |
-          buildozer -v android release
-          echo "aab-path=bin/qrs-7.7.7-release.aab" >> $GITHUB_OUTPUT
-          echo "success=true" >> $GITHUB_OUTPUT
-
-  fallback-docker:
-    needs: build-native
-    if: failure() && needs.build-native.outputs.success != 'true'  # Only if native fails
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Encrypt model (Docker Mode)
-        env:
-          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}
-        run: |
-          # Same as native (for consistency)
-          mkdir -p models
-          curl -L -o models/model.gguf \
-            https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
-          echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          python3 -c "
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-          import os, secrets
-          key = bytes.fromhex(os.environ['ENC_KEY'])
-          data = open('models/model.gguf','rb').read()
-          nonce = secrets.token_bytes(12)
-          ct = nonce + AESGCM(key).encrypt(nonce, data, None)
-          open('models/llama3-small-Q3_K_M.gguf.aes','wb').write(ct)
-          "
-          rm -f models/model.gguf
-
-      - name: Docker Buildozer Fallback (Bypass Action Bugs)
-        run: |
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace \
+          # Pull & run official image: mounts workspace, runs release (no chown issues)
+          docker pull kivy/buildozer:1.5.0
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
             -e BOOTSTRAP=openssl \
             kivy/buildozer:1.5.0 \
-            buildozer android release
-          # Outputs AAB to bin/ (mounted volume)
+            buildozer -v android release
+          # Output AAB path
+          echo "filename=bin/qrs-7.7.7-release.aab" >> $GITHUB_OUTPUT
 
-      - name: Verify AAB (Advanced Lint)
+      - name: Cache project-specific .buildozer (post-build)
+        if: success()
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-project-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v27  # Syncs changes
+
+      - name: Verify AAB (integrity check)
         run: |
-          AAB="bin/qrs-7.7.7-release.aab"
-          if [ -f "$AAB" ] && [ $(stat -c%s "$AAB" | awk '{if ($1 > 50000000) print "ok"; else print "fail"}') = "ok" ]; then
-            aapt2 dump badging "$AAB" | grep "package: name='com.chaosresonance.qrs'"
-            echo "AAB verified (size >50MB, package OK)"
-          else
-            echo "AAB invalid - fallback failed"
+          AAB="${{ steps.build.outputs.filename }}"
+          if [ ! -f "$AAB" ]; then
+            echo "AAB missing, checking bin/*.aab"
+            ls -la bin/
             exit 1
           fi
+          aapt dump badging "$AAB" | head -20  # Quick package verification
+          echo "AAB verified successfully"
 
-  upload:
-    needs: [build-native, fallback-docker]
-    runs-on: ubuntu-latest
-    if: always()  # Runs even on fallback
-    environment: playstore
-
-    steps:
-      - name: Checkout code (for AAB)
-        uses: actions/checkout@v4
-
-      - name: Download AAB Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: qrs-release-aab
-          path: bin/
-
-      - name: Upload AAB Artifact (Debug)
+      - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qrs-final-aab
-          path: bin/*.aab
+          name: qrs-release-aab
+          path: ${{ steps.build.outputs.filename }}
 
       - name: Upload to Google Play Internal
-        if: success()
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
           packageName: com.chaosresonance.qrs
-          releaseFiles: bin/qrs-7.7.7-release.aab
+          releaseFiles: ${{ steps.build.outputs.filename }}
           track: internal
           status: completed

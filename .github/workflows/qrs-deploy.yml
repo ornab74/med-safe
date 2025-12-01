@@ -1,103 +1,36 @@
-name: QRS → Google Play (Internal)
+[app]
+title = QRS — Quantum Road Scanner
+package.name = qrs
+package.domain = com.chaosresonance
+version = 7.7.7
+android.numeric_version = 777
 
-on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+source.dir = .
+source.include_exts = py,png,jpg,jpeg,ttf,otf,kv,atlas,gguf,aes,db,txt,md,json,wav
+source.exclude_dirs = .git,.buildozer,bin,__pycache__,.github,.venv
+source.exclude_patterns = *.pyc,*.pyo,*.log,tmp.db,*.bak
 
-jobs:
-  build-and-upload:
-    runs-on: ubuntu-latest
-    environment: playstore
-    timeout-minutes: 90
+requirements = python3==3.11.9,kivy==2.3.0,kivymd==1.2.0,numpy==1.26.4,pyjnius,android,psutil,httpx,aiosqlite,cryptography==42.0.8,pennylane==0.36.0,pennylane-lightning==0.36.0,llama-cpp-python==0.2.85
+android.pip_install_pre = cryptography==42.0.8,pennylane-lightning==0.36.0
 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+orientation = portrait
+fullscreen = 0
+presplash.filename = %(source.dir)s/data/presplash.png
+icon.filename = %(source.dir)s/data/icon.png
 
-      - name: Free up disk space (recommended for 2025 runners)
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+android.api = 35
+android.minapi = 24
+android.sdk = 35
+android.ndk = 28c
+android.release_artifact = aab
+android.archs = arm64-v8a, armeabi-v7a
 
-      - name: Cache global Buildozer tools (~/.buildozer)
-        uses: actions/cache@v4
-        with:
-          path: ~/.buildozer
-          key: buildozer-global-${{ runner.os }}-v31
-          restore-keys: buildozer-global-${{ runner.os }}-
+android.permissions = INTERNET,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC
 
-      - name: Cache project .buildozer directory
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v31
-          restore-keys: |
-            buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-
-            buildozer-${{ runner.os }}-
+p4a.branch = stable
+android.accept_sdk_license = True
+log_level = 2
 
-      - name: Encrypt model
-        env:
-          ENC_KEY: ${{ secrets.QRS_ENC_KEY }}
-        run: |
-          mkdir -p models
-          curl -L -o models/model.gguf \
-            https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
-          echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          python3 - <<'PY'
-          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-          import os, secrets
-          key = bytes.fromhex(os.environ['ENC_KEY'])
-          data = open('models/model.gguf', 'rb').read()
-          nonce = secrets.token_bytes(12)
-          ct = nonce + AESGCM(key).encrypt(nonce, data, None)
-          open('models/llama3-small-Q3_K_M.gguf.aes', 'wb').write(ct)
-          PY
-          rm -f models/model.gguf
-
-      - name: Build AAB using official Kivy Buildozer Docker (fixed binary path)
-        run: |
-          docker run --rm \
-            --entrypoint /bin/bash \
-            -v "$HOME/.buildozer":/home/user/.buildozer \
-            -v "$(pwd)":/home/user/hostcwd \
-            -w /home/user/hostcwd \
-            ghcr.io/kivy/buildozer:latest \
-            -c "/usr/local/bin/buildozer -v android release"
-
-      - name: Find generated AAB
-        id: find_aab
-        run: |
-          AAB=$(ls bin/*.aab 2>/dev/null | head -1)
-          if [ -z "$AAB" ]; then
-            echo "No AAB found in bin/"
-            ls -la bin/
-            exit 1
-          fi
-          echo "AAB found: $AAB"
-          echo "aab_path=$AAB" >> $GITHUB_OUTPUT
-
-      - name: Verify AAB
-        run: |
-          aapt dump badging "${{ steps.find_aab.outputs.aab_path }}" | head -20
-          echo "AAB is valid"
-
-      - name: Upload AAB as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: qrs-release-aab
-          path: ${{ steps.find_aab.outputs.aab_path }}
-
-      - name: Upload to Google Play Internal Testing
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}
-          packageName: com.chaosresonance.qrs
-          releaseFiles: ${{ steps.find_aab.outputs.aab_path }}
-          track: internal
-          status: completed
+[buildozer]
+log_level = 2
+warn_on_root = 1

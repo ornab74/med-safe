@@ -22,8 +22,8 @@ android.minapi = 24
 android.sdk = 35
 android.ndk = 25
 android.release_artifact = aab
-android.archs = arm64-v8a, armeabi-v7a
 
+android.archs = arm64-v8a
 android.permissions = ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC
 android.block_network_permissions = True
 

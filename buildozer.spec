@@ -13,15 +13,14 @@ requirements = python3==3.11.9,kivy==2.3.0,kivymd==1.2.0,numpy,pyjnius,android,p
 
 p4a.branch = develop
 p4a.fork = kivy
+p4a.commit = 9b3f8a7d
 
 android.archs = arm64-v8a
-
 android.ndk_api = 35
 android.minapi = 24
 android.api = 35
 android.sdk = 35
 android.ndk = 27
-
 android.release_artifact = aab
 
 android.permissions = ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,FOREGROUND_SERVICE,FOREGROUND_SERVICE_DATA_SYNC

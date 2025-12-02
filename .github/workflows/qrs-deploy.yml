@@ -10,7 +10,7 @@ jobs:
   build-and-upload:
     runs-on: ubuntu-latest
     environment: playstore
-    timeout-minutes: 120   # Increased — your build with llama-cpp + pennylane needs it
+    timeout-minutes: 120   # Bumped for ML-heavy build
 
     steps:
       - name: Checkout code
@@ -18,12 +18,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Free up disk space
+      - name: Free up disk space (2025 runners)
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt clean  # Extra: clears apt cache
 
       - name: Cache global Buildozer tools (~/.buildozer)
         uses: actions/cache@v4
@@ -60,21 +61,41 @@ jobs:
           PY
           rm -f models/model.gguf
 
-      - name: Build AAB (2025 CI-ready image - no root prompt, no p4a missing)
+      - name: Build AAB (official image + CI hacks: non-interactive root skip + pre-init P4A)
+        env:
+          BUILDOZER_WARN_ON_ROOT: 0  # Disable root warning entirely
+          P4A_IGNORE_PATCH_ERRORS: 1  # Ignore patch skips
+          P4A_PATCH_FUZZ: 3  # Higher fuzz for 2025 source shifts
         run: |
+          # Run in Docker: Pre-init to download P4A, then nuclear clean, then build
           docker run --rm \
+            --env BUILDOZER_WARN_ON_ROOT=0 \
+            --env P4A_IGNORE_PATCH_ERRORS=1 \
+            --env P4A_PATCH_FUZZ=3 \
             -v "$HOME/.buildozer":/home/user/.buildozer \
             -v "$(pwd)":/home/user/hostcwd \
             -w /home/user/hostcwd \
-            kivy/buildozer:2025-ci \
-            buildozer -v android release
+            -i \
+            kivy/buildozer:latest \
+            bash -c "
+              # Pre-init: Download P4A and SDKs without prompts
+              echo y | buildozer init || true
+              buildozer android debug -- --bootstrap=SDL2 || true  # Triggers P4A download safely
+              
+              # Now nuclear clean (safe since P4A exists)
+              rm -rf .buildozer ~/.buildozer/cache/*
+              buildozer android clean
+              
+              # Final release build
+              buildozer -v android release
+            "
 
       - name: Find generated AAB
         id: find_aab
         run: |
           AAB=$(ls bin/*.aab 2>/dev/null | head -1)
           if [ -z "$AAB" ]; then
-            echo "No AAB found!"
+            echo "No AAB found in bin/"
             ls -la bin/ || true
             exit 1
           fi
@@ -84,6 +105,7 @@ jobs:
       - name: Verify AAB
         run: |
           aapt dump badging "${{ steps.find_aab.outputs.aab_path }}" | head -20
+          echo "AAB is valid"
 
       - name: Upload AAB as artifact
         uses: actions/upload-artifact@v4

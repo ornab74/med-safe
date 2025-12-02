@@ -10,7 +10,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,kv,atlas,gguf,aes,db,txt,md,json,w
 source.exclude_dirs = .git,.buildozer,bin,__pycache__,.github,.venv
 source.exclude_patterns = *.pyc,*.pyo,*.log,tmp.db,*.bak
 
-requirements = python3==3.11.9,https://github.com/kivymd/KivyMD,kivy==2.3.0,numpy,pyjnius,android,psutil,httpx,aiosqlite,cryptography==42.0.8,pennylane==0.36.0,pennylane-lightning==0.36.0,llama-cpp-python
+requirements = python3==3.11.9,https://github.com/kivymd/KivyMD/archive/master.zip,kivy==2.3.0,numpy,pyjnius,android,psutil,httpx,aiosqlite,cryptography==42.0.8,pennylane==0.36.0,pennylane-lightning==0.36.0,llama-cpp-python
 android.pip_install_pre = cryptography==42.0.8,pennylane-lightning==0.36.0
 
 orientation = portrait

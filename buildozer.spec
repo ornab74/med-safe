@@ -10,8 +10,7 @@ source.include_exts = py,png,jpg,jpeg,ttf,otf,kv,atlas,gguf,aes,db,txt,md,json,w
 source.exclude_dirs = .git,.buildozer,bin,__pycache__,.github,.venv
 source.exclude_patterns = *.pyc,*.pyo,*.log,tmp.db,*.bak
 
-requirements = python3==3.14.0,https://github.com/kivymd/KivyMD/archive/master.zip,kivy==2.3.0,numpy,pyjnius,android,psutil,httpx,aiosqlite,cryptography==42.0.8,pennylane==0.36.0,pennylane-lightning==0.36.0,llama-cpp-python
-android.pip_install_pre = cryptography==42.0.8,pennylane-lightning==0.36.0
+requirements = python3==3.13.2,https://github.com/kivymd/KivyMD/archive/master.zip,kivy==2.3.0,numpy,pyjnius,android,psutil,httpx,aiosqlite,cryptography==42.0.8,pennylane==0.36.0,pennylane-lightning==0.36.0,llama-cpp-python
 
 orientation = portrait
 fullscreen = 0
@@ -24,7 +23,7 @@ p4a.fork = kivy
 android.api = 35
 android.minapi = 24
 android.sdk = 35
-android.ndk = 25b
+android.ndk = 26
 android.release_artifact = aab
 android.archs = arm64-v8a, armeabi-v7a
 

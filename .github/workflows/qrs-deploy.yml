@@ -27,12 +27,19 @@ jobs:
           yarn install
           yarn add @callstack/polygen react-native-wasm
 
-      - name: Prepare WASM module
+      - name: Prepare Python WASM
         run: |
-          # Polygen expects an existing WASM file. 
-          # Replace this with your own Python-to-WASM build command if needed
           mkdir -p wasm
-          cp python-backend/main.wasm wasm/qrs.wasm || echo "WASM file not found, generate it before Polygen"
+          # Replace this with your actual Python-to-WASM build command
+          # For now, just copy prebuilt WASM if it exists
+          cp python-backend/main.wasm wasm/qrs.wasm || echo "WASM not found. Compile main.py first."
+
+      - name: Setup Polygen
+        run: |
+          # Ensure you have a polygen config at repo root: polygen.config.js
+          if [ ! -f polygen.config.js ]; then
+            echo "module.exports = { outputDir: 'wasm', targets: ['react-native'] };" > polygen.config.js
+          fi
 
       - name: Run Polygen
         run: |
@@ -41,7 +48,7 @@ jobs:
 
       - name: Build Android AAB
         run: |
-          cd android
+          cd qrs-android/android
           ./gradlew bundleRelease
 
       - name: Upload to Play Internal
@@ -49,5 +56,5 @@ jobs:
         with:
           serviceAccountJson: ${{ secrets.PLAY_STORE_KEY }}
           packageName: com.chaosresonance.qrs
-          releaseFiles: android/app/build/outputs/bundle/release/app-release.aab
+          releaseFiles: qrs-android/android/app/build/outputs/bundle/release/app-release.aab
           track: internal

@@ -24,7 +24,7 @@ p4a.fork = kivy
 android.api = 35
 android.minapi = 24
 android.sdk = 35
-android.ndk = 28c
+android.ndk = 27
 android.release_artifact = aab
 android.archs = arm64-v8a, armeabi-v7a
 

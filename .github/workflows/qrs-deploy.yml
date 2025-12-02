@@ -1,4 +1,4 @@
-name: QRS → Google Play (Internal)
+name: QRS - Google Play (Internal)
 
 on:
   push:
@@ -10,7 +10,7 @@ jobs:
   build-and-upload:
     runs-on: ubuntu-latest
     environment: playstore
-    timeout-minutes: 90
+    timeout-minutes: 120   # Increased — your build with llama-cpp + pennylane needs it
 
     steps:
       - name: Checkout code
@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Free up disk space (recommended for 2025 runners)
+      - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
@@ -60,34 +60,22 @@ jobs:
           PY
           rm -f models/model.gguf
 
-      - name: Build AAB using official Kivy Buildozer Docker (env to avoid patches + nuclear clean)
-        env:
-          P4A_IGNORE_PATCH_ERRORS: 1  # Key: Ignore "skipping patch" as non-fatal (avoids 3.14_armv7l_fix crash)
-          P4A_PATCH_FUZZ: 2           # Allows minor hunk offsets for sysconfig patches
+      - name: Build AAB (2025 CI-ready image - no root prompt, no p4a missing)
         run: |
-          # Nuclear clean inside env (prevents cached patch glitches)
-          echo y | docker run --rm \
-            --entrypoint /bin/bash \
+          docker run --rm \
             -v "$HOME/.buildozer":/home/user/.buildozer \
             -v "$(pwd)":/home/user/hostcwd \
             -w /home/user/hostcwd \
-            -i \
-            -e P4A_IGNORE_PATCH_ERRORS=1 \
-            -e P4A_PATCH_FUZZ=2 \
-            ghcr.io/kivy/buildozer:latest \
-            -c "
-              rm -rf .buildozer ~/.buildozer
-              buildozer android clean
-              buildozer -v android release
-            "
+            kivy/buildozer:2025-ci \
+            buildozer -v android release
 
       - name: Find generated AAB
         id: find_aab
         run: |
           AAB=$(ls bin/*.aab 2>/dev/null | head -1)
           if [ -z "$AAB" ]; then
-            echo "No AAB found in bin/"
-            ls -la bin/
+            echo "No AAB found!"
+            ls -la bin/ || true
             exit 1
           fi
           echo "AAB found: $AAB"
@@ -96,7 +84,6 @@ jobs:
       - name: Verify AAB
         run: |
           aapt dump badging "${{ steps.find_aab.outputs.aab_path }}" | head -20
-          echo "AAB is valid"
 
       - name: Upload AAB as artifact
         uses: actions/upload-artifact@v4

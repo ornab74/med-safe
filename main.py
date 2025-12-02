@@ -34,7 +34,15 @@ if platform=="android":
     LocationManager = autoclass('android.location.LocationManager')
     Context = autoclass('android.content.Context')
     LocationListener = autoclass('android.location.LocationListener')
+import os
+import ctypes
 
+# Load real Python 3.14
+lib = ctypes.CDLL("data/python314/lib/libpython3.14.so")
+lib.Py_Initialize()
+
+# Optional: run a test
+lib.PyRun_SimpleString("import sys; print('Python', sys.version)".encode())
 # ────────────────────────────── CONSTANTS ──────────────────────────────
 MODEL_REPO="https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/"
 MODEL_FILE="llama3-small-Q3_K_M.gguf"

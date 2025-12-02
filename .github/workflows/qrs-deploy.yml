@@ -28,10 +28,25 @@ jobs:
       - name: Install missing build tools (for wheel compilation)
         run: |
           sudo apt update
-          sudo apt install -y build-essential autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 libffi-dev libssl-dev cmake git unzip openjdk-17-jdk python3-pip cython3
+          sudo apt install -y build-essential autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 libffi-dev libssl-dev cmake git unzip openjdk-17-jdk python3-pip cython3 gcc  # Explicit gcc for host
           sudo apt clean
           pip3 install --user --upgrade cython==3.0.11 setuptools wheel
           export PATH="$HOME/.local/bin:$PATH"
+
+      - name: Pre-fix host build env (native compiler + libs for configure)
+        run: |
+          # Unset cross-env for host (let configure use /usr/bin/gcc)
+          unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+          # Fix LD_LIBRARY_PATH for host libs (avoids NDK override)
+          export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+          # Touch missing Python 3.14 headers if needed (from earlier)
+          mkdir -p .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/other_builds/hostpython3/desktop/hostpython3/Include/internal
+          touch .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/other_builds/hostpython3/desktop/hostpython3/Include/internal/pycore_frame.h
+          echo "#ifndef PyCORE_FRAME_H" > .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/other_builds/hostpython3/desktop/hostpython3/Include/internal/pycore_frame.h
+          echo "#define PyCORE_FRAME_H" >> .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/other_builds/hostpython3/desktop/hostpython3/Include/internal/pycore_frame.h
+          echo "#endif" >> .buildozer/android/platform/build-arm64-v8a_armeabi-v7a/build/other_builds/hostpython3/desktop/hostpython3/Include/internal/pycore_frame.h
+          # Clear ccache
+          rm -rf ~/.ccache
 
       - name: Cache global Buildozer tools (~/.buildozer)
         uses: actions/cache@v4
@@ -73,11 +88,13 @@ jobs:
           BUILDOZER_WARN_ON_ROOT: 0  # Skip root prompt
           P4A_IGNORE_PATCH_ERRORS: 1  # Ignore patch skips
           P4A_PATCH_FUZZ: 10  # High fuzz for 3.14 paths
+          # Target-only cross-env (not global for host)
+          CC: /root/.buildozer/android/platform/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/clang  # Full NDK clang path for target
+          CXX: /root/.buildozer/android/platform/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
           USE_CCACHE: 0  # Disable ccache corruption
-          CC: clang  # Raw compiler
-          CXX: clang++
         run: |
-          echo y | docker run --rm \
+          # Re-unset for host inside Docker (ensures native gcc)
+          docker run --rm \
             --entrypoint /bin/bash \
             -v "$HOME/.buildozer":/home/user/.buildozer \
             -v "$(pwd)":/home/user/hostcwd \
@@ -87,10 +104,13 @@ jobs:
             -e P4A_IGNORE_PATCH_ERRORS=1 \
             -e P4A_PATCH_FUZZ=10 \
             -e USE_CCACHE=0 \
-            -e CC=clang \
-            -e CXX=clang++ \
+            -e LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:/root/.buildozer/android/platform/android-ndk-r27/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib" \
             ghcr.io/kivy/buildozer:latest \
-            -c "buildozer -v android release"
+            -c "
+              unset CC CXX CFLAGS CXXFLAGS CPPFLAGS LDFLAGS  # Native for host
+              echo y | buildozer android clean || true
+              buildozer -v android release
+            "
 
       - name: Find generated AAB
         id: find_aab

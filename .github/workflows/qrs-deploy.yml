@@ -10,7 +10,7 @@ jobs:
   build-and-upload:
     runs-on: ubuntu-latest
     environment: playstore
-    timeout-minutes: 120  # Bumped for ~60-90 min builds
+    timeout-minutes: 120  # Bumped for ~60-90 min builds with llama-cpp/pennylane
 
     steps:
       - name: Checkout code
@@ -21,7 +21,7 @@ jobs:
       - name: Free up disk space (recommended for 2025 runners)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
-          sudo apt clean || true  # Extra space
+          sudo apt clean || true
 
       - name: Cache global Buildozer tools (~/.buildozer)
         uses: actions/cache@v4
@@ -58,15 +58,15 @@ jobs:
           PY
           rm -f models/model.gguf
 
-      - name: Build AAB using official Kivy Buildozer Docker (CLI patch ignores + non-interactive)
+      - name: Build AAB - Clean (direct command + CLI patch ignores)
         env:
           BUILDOZER_WARN_ON_ROOT: 0  # Skip root warning
-          P4A_IGNORE_PATCH_ERRORS: 1  # Ignore failed patches (your main fix)
-          P4A_PATCH_FUZZ: 5  # High fuzz for outdated recipes (e.g., pennylane/llama-cpp)
-          P4A_DEBUG: 1  # Verbose P4A logs if needed
-          BUILD_MENUCONFIG: 0  # Skip interactive prompts
+          P4A_IGNORE_PATCH_ERRORS: 1  # Ignore failed patches (key for llama-cpp/pennylane)
+          P4A_PATCH_FUZZ: 5  # High fuzz for outdated recipes
+          P4A_DEBUG: 1  # Verbose logs if needed
+          BUILD_MENUCONFIG: 0  # Skip prompts
         run: |
-          # Direct command (no /bin/bash) — image has no ENTRYPOINT
+          # Direct clean command (no shell wrapper)
           docker run --rm \
             -v "$HOME/.buildozer:/home/user/.buildozer" \
             -v "$(pwd):/home/user/hostcwd" \
@@ -77,7 +77,28 @@ jobs:
             -e P4A_DEBUG=1 \
             -e BUILD_MENUCONFIG=0 \
             ghcr.io/kivy/buildozer:latest \
-            sh -c "echo y | buildozer android clean || true && buildozer -v android release"
+            android clean
+
+      - name: Build AAB - Release (direct command + CLI patch ignores)
+        env:
+          BUILDOZER_WARN_ON_ROOT: 0
+          P4A_IGNORE_PATCH_ERRORS: 1
+          P4A_PATCH_FUZZ: 5
+          P4A_DEBUG: 1
+          BUILD_MENUCONFIG: 0
+        run: |
+          # Direct release command (no shell wrapper)
+          docker run --rm \
+            -v "$HOME/.buildozer:/home/user/.buildozer" \
+            -v "$(pwd):/home/user/hostcwd" \
+            -w /home/user/hostcwd \
+            -e BUILDOZER_WARN_ON_ROOT=0 \
+            -e P4A_IGNORE_PATCH_ERRORS=1 \
+            -e P4A_PATCH_FUZZ=5 \
+            -e P4A_DEBUG=1 \
+            -e BUILD_MENUCONFIG=0 \
+            ghcr.io/kivy/buildozer:latest \
+            -v android release
 
       - name: Find generated AAB
         id: find_aab

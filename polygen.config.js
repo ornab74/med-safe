@@ -1,7 +1,14 @@
 module.exports = {
-  outputDir: "wasm",           // where generated code will go
+  outputDir: "wasm",           // where generated glue code goes
   targets: ["react-native"],   // target platform
   scan: {
-    paths: ["wasm/qrs.wasm"],  // path(s) to WASM module(s) to integrate
+    paths: ["wasm/qrs.wasm"]  // your compiled WASM file
   },
+  modules: [
+    {
+      kind: "local",          // local WASM module
+      path: "wasm/qrs.wasm",  // path relative to repo root
+      name: "qrs"             // optional: internal name
+    }
+  ]
 };

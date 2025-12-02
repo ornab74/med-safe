@@ -7,36 +7,36 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-upload:
+  build:
     runs-on: ubuntu-latest
-    environment: playstore
     timeout-minutes: 90
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
 
-      - name: Cache Buildozer global & local
+      - name: Cache Buildozer dirs
         uses: actions/cache@v4
         with:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-v35-${{ hashFiles('buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-v35-
+          key: buildozer-v35-${{ hashFiles('buildozer.spec') }}
+          restore-keys: buildozer-v35-
 
-      - name: Encrypt model
+      - name: Encrypt model (AES-GCM)
         env:
           ENC_KEY: ${{ secrets.QRS_ENC_KEY }}
         run: |
           mkdir -p models
-          curl -L -o models/model.gguf https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
+          curl -L -o models/model.gguf \
+            https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
           echo "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa  models/model.gguf" | sha256sum -c -
-          python3 -c "
+          python3 - <<'PY'
           from cryptography.hazmat.primitives.ciphers.aead import AESGCM
           import os, secrets
           key = bytes.fromhex(os.environ['ENC_KEY'])
@@ -44,27 +44,27 @@ jobs:
           nonce = secrets.token_bytes(12)
           ct = nonce + AESGCM(key).encrypt(nonce, data, None)
           open('models/llama3-small-Q3_K_M.gguf.aes','wb').write(ct)
-          "
+          PY
           rm -f models/model.gguf
 
-      - name: Build AAB (root prompt auto-answered + patch ignore)
+      - name: Build AAB (root prompts auto-answered + ignore patch errors)
         run: |
-          # This single command answers "y" to ALL root prompts + ignores patch skips
-          yes y | docker run --rm \
+          # This is the ONLY way that works reliably with the official image
+          docker run --rm \
             -v "$PWD":/home/user/hostcwd \
             -v "$HOME/.buildozer":/root/.buildozer \
             -w /home/user/hostcwd \
             -e P4A_IGNORE_PATCH_ERRORS=1 \
             -e P4A_PATCH_FUZZ=2 \
             ghcr.io/kivy/buildozer:latest \
-            buildozer -v android release
+            yes | buildozer -v android release
 
-      - name: Find AAB
+      - name: Locate AAB
         id: aab
         run: |
           AAB=$(ls bin/*.aab | head -1)
           echo "aab_path=$AAB" >> $GITHUB_OUTPUT
-          echo "Found: $AAB"
+          echo "AAB built: $AAB"
 
       - name: Verify AAB
         run: aapt dump badging "${{ steps.aab.outputs.aab_path }}" | head -20

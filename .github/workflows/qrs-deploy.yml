@@ -1,4 +1,4 @@
-name: QRS - Google Play
+name: QRS - Google Play   # ← This is now at the top level (correct for workflow name)
 
 on:
   push:

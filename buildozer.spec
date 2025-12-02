@@ -13,7 +13,6 @@ requirements = python3==3.11.9,kivy==2.3.0,kivymd==1.2.0,numpy,pyjnius,android,p
 
 p4a.branch = develop
 p4a.fork = kivy
-p4a.commit = 9b3f8a7d
 
 android.archs = arm64-v8a
 android.ndk_api = 35

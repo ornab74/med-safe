@@ -39,15 +39,13 @@ jobs:
 
       - name: Setup Polygen config
         run: |
-          cat <<EOT > polygen.config.js
-module.exports = {
-  outputDir: "wasm",
-  targets: ["react-native"],
+          echo "module.exports = {
+  outputDir: 'wasm',
+  targets: ['react-native'],
   scan: {
-    paths: ["wasm/qrs.wasm"]
+    paths: ['wasm/qrs.wasm']
   }
-};
-EOT
+};" > polygen.config.js
 
       - name: Run Polygen
         run: |

@@ -20,24 +20,21 @@ jobs:
 
       - name: Free up disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
           sudo apt clean || true
 
       - name: Cache global Buildozer tools
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-global-${{ runner.os }}-v35
+          key: buildozer-global-${{ runner.os }}-v36
           restore-keys: buildozer-global-${{ runner.os }}-
 
       - name: Cache project .buildozer directory
         uses: actions/cache@v4
         with:
           path: .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v35
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-v36
           restore-keys: |
             buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-
             buildozer-${{ runner.os }}-
@@ -61,7 +58,7 @@ jobs:
           PY
           rm -f models/model.gguf
 
-      - name: Build AAB - Official Docker + CI fixes (no root prompt, no P4A missing)
+      - name: Build AAB - Working CI version (Dec 2025)
         env:
           BUILDOZER_WARN_ON_ROOT: 0
           P4A_IGNORE_PATCH_ERRORS: 1
@@ -75,20 +72,13 @@ jobs:
             -v "$(pwd):/home/user/hostcwd" \
             -w /home/user/hostcwd \
             kivy/buildozer:latest \
-            bash -c "
-              echo y | buildozer android clean || true
-              buildozer -v android release
-            "
+            buildozer -v android release
 
       - name: Find generated AAB
         id: find_aab
         run: |
           AAB=$(ls bin/*.aab 2>/dev/null | head -1)
-          if [ -z "$AAB" ]; then
-            echo "No AAB found!"
-            ls -la bin/ || true
-            exit 1
-          fi
+          [ -z "$AAB" ] && { echo "No AAB found!"; ls -la bin/; exit 1; }
           echo "AAB found: $AAB"
           echo "aab_path=$AAB" >> $GITHUB_OUTPUT
 
@@ -102,7 +92,7 @@ jobs:
           name: qrs-release-aab
           path: ${{ steps.find_aab.outputs.aab_path }}
 
-      - name: Upload to Google Play Internal Testing
+      - name: Upload to Google Play Internal
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT }}

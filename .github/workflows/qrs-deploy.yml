@@ -2,72 +2,100 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
 
 jobs:
-  build-android:
+  build:
     runs-on: ubuntu-22.04
 
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 🔧 Native build tools (this fixes the LT_SYS_SYMBOL_USCORE / libffi error)
+      # ---- JDK 17 (fix for sdkmanager classfile 61.0) ----
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Show Java version (debug)
+        run: |
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+
+      # ---- Python & system deps ----
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
       - name: Install system dependencies
         run: |
-          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y \
             build-essential git zip unzip \
-            autoconf automake libtool pkg-config \
-            libffi-dev libssl-dev libbz2-dev libreadline-dev \
-            libsqlite3-dev zlib1g-dev \
-            python3-pip python3-setuptools python3-wheel \
-            openjdk-17-jdk \
-            libc6-dev-i386 libncurses5:i386 libstdc++6:i386
+            libssl-dev libffi-dev libsqlite3-dev \
+            libbz2-dev zlib1g-dev \
+            libncurses5-dev libgdbm-dev libnss3-dev \
+            libreadline-dev libffi-dev liblzma-dev \
+            libjpeg-dev libfreetype6-dev
 
-      - name: Install Buildozer
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install --upgrade buildozer cython
-
-      # 📦 Android SDK + NDK (cmdline-tools)
-      - name: Install Android SDK / NDK
-        env:
-          ANDROID_SDK_ROOT: ${{ github.workspace }}/.android-sdk
+      # ---- Install Android SDK cmdline-tools ----
+      - name: Install Android SDK (cmdline-tools)
         run: |
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -Lo cmdline-tools.zip \
+
+          # Download latest commandline tools
+          curl -o cmdline-tools.zip \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q cmdline-tools.zip
-          mv cmdline-tools latest
 
-          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          mkdir -p latest
+          unzip -q cmdline-tools.zip -d latest
+          rm cmdline-tools.zip
 
-          yes | sdkmanager --licenses
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/emulator" >> $GITHUB_PATH
 
+      - name: Install Android platforms / build-tools
+        run: |
+          yes | sdkmanager --licenses || true
           yes | sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
-            "build-tools;34.0.0" \
-            "ndk;27.3.13797024"
+            "build-tools;34.0.0"
 
-      # 🏗️ Build the APK (keeps ALL your libs/requirements)
-      - name: Build debug APK
-        env:
-          ANDROID_SDK_ROOT: ${{ github.workspace }}/.android-sdk
-          ANDROID_HOME: ${{ github.workspace }}/.android-sdk
-          ANDROID_NDK_ROOT: ${{ github.workspace }}/.android-sdk/ndk/27.3.13797024
-          ANDROID_NDK_HOME: ${{ github.workspace }}/.android-sdk/ndk/27.3.13797024
+      # ---- Install Buildozer & your Python libs ----
+      - name: Install Buildozer & dependencies
         run: |
-          export PATH="$ANDROID_SDK_ROOT/platform-tools:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
-          buildozer android debug
+          python -m pip install --upgrade pip
+          pip install \
+            buildozer \
+            cython \
+            kivy==2.2.1 \
+            kivymd \
+            httpx \
+            cryptography \
+            aiosqlite \
+            psutil \
+            pennylane \
+            llama-cpp-python
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: qrs-android-debug
-          path: bin/*.apk
+      # Buildozer expects ANDROIDSDK / ANDROIDNDK set sometimes
+      - name: Export Android env
+        run: |
+          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROIDNDK=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+
+      # ---- Build debug APK ----
+      - name: Build debug APK
+        run: |
+          buildozer android debug

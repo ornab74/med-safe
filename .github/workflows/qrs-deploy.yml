@@ -18,14 +18,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- JDK 17 (fix for sdkmanager classfile 61.0) ----
+      # ---- JDK 17 (needed by latest sdkmanager) ----
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Show Java version (debug)
+      - name: Show Java version
         run: |
           java -version
           echo "JAVA_HOME=$JAVA_HOME"
@@ -47,34 +47,45 @@ jobs:
             libreadline-dev libffi-dev liblzma-dev \
             libjpeg-dev libfreetype6-dev
 
-      # ---- Install Android SDK cmdline-tools ----
+      # ---- Install Android SDK cmdline-tools (FIXED PATH) ----
       - name: Install Android SDK (cmdline-tools)
         run: |
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
 
-          # Download latest commandline tools
+          # download commandline-tools
           curl -o cmdline-tools.zip \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
 
-          mkdir -p latest
-          unzip -q cmdline-tools.zip -d latest
+          # unzip into tmp, then move inner cmdline-tools -> latest
+          mkdir -p tmp
+          unzip -q cmdline-tools.zip -d tmp
           rm cmdline-tools.zip
 
+          # structure after unzip: tmp/cmdline-tools/...
+          rm -rf latest
+          mv tmp/cmdline-tools latest
+          rmdir tmp
+
+          # final sdkmanager path: $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager
+          ls -R
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/emulator" >> $GITHUB_PATH
 
       - name: Install Android platforms / build-tools
         run: |
+          which sdkmanager || echo "sdkmanager not in PATH!"
+          sdkmanager --version || true
+
           yes | sdkmanager --licenses || true
           yes | sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      # ---- Install Buildozer & your Python libs ----
-      - name: Install Buildozer & dependencies
+      # ---- Install Buildozer & all your Python libs ----
+      - name: Install Buildozer & Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install \
@@ -89,8 +100,7 @@ jobs:
             pennylane \
             llama-cpp-python
 
-      # Buildozer expects ANDROIDSDK / ANDROIDNDK set sometimes
-      - name: Export Android env
+      - name: Export Android env vars
         run: |
           echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROIDNDK=$ANDROID_NDK_HOME" >> $GITHUB_ENV

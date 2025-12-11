@@ -1,110 +1,77 @@
-name: QRS - Google Play
+name: Android APK Build
 
 on:
+  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
     branches:
       - main
-  workflow_dispatch:
+      - master
+    paths:
+      - 'main.py'
+      - 'buildozer.spec'
+      - '.github/workflows/android-build.yml'
 
 jobs:
-  build-and-deploy:
+  build-android:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
-          cache: 'yarn'
+          python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
-          yarn install --frozen-lockfile
-          yarn add @callstack/polygen react-native-wasm pyodide-build
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            zip \
+            unzip \
+            openjdk-17-jdk \
+            libffi-dev \
+            libssl-dev \
+            libsqlite3-dev \
+            zlib1g-dev \
+            libjpeg-dev \
+            libfreetype6-dev \
+            libsdl2-dev \
+            libsdl2-image-dev \
+            libsdl2-mixer-dev \
+            libsdl2-ttf-dev \
+            libportmidi-dev \
+            libswscale-dev \
+            libavformat-dev \
+            libavcodec-dev \
+            libgstreamer1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-tools \
+            libmtdev-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev
 
-      # ────────────────────── 1. Build WASM from python-backend/main.py ──────────────────────
-      - name: Build WASM (pyodide)
+      - name: Install Buildozer & Cython
         run: |
-          mkdir -p wasm
+          python -m pip install --upgrade pip
+          # Buildozer prefers Cython < 3 right now for p4a
+          pip install "Cython<3" buildozer
 
-          npx pyodide-build build \
-            --package python-backend \
-            --entrypoint main.py \
-            --export-name qrs \
-            --output wasm/qrs.wasm
-
-          # Safety check
-          test -f wasm/qrs.wasm || (echo "WASM not created!" && ls -la wasm/ && exit 1)
-          echo "WASM built → $(du -h wasm/qrs.wasm | cut -f1)"
-
-      # ────────────────────── 2. Create correct polygen.config.js ──────────────────────
-      - name: Create Polygen config
+      - name: Build debug APK
+        env:
+          # Avoid interactive questions
+          BUILDOZER_WARN_ON_ROOT: "0"
         run: |
-          cat > polygen.config.js <<'EOF'
-          const { localModule } = require('@callstack/polygen-config');
+          buildozer android debug
 
-          module.exports = {
-            outputDir: 'wasm',
-            targets: ['react-native'],
-            modules: [
-              localModule('wasm/qrs.wasm', {
-                exportName: 'qrs'   // must match --export-name above
-              })
-            ]
-          };
-          EOF
-
-          echo "polygen.config.js created:"
-          cat polygen.config.js
-
-      # ────────────────────── 3. Run Polygen (scan + generate) ──────────────────────
-      - name: Run Polygen
-        run: |
-          npx polygen scan --verbose
-          npx polygen generate --verbose
-
-      # ────────────────────── 4. Patch App.tsx so React Native loads the module correctly ──────────────────────
-      - name: Patch App.tsx for WASM loading
-        run: |
-          # This adds the auto-generated init code that Polygen expects
-          cat > App.tsx <<'EOF'
-          import { registerWasmModule } from 'react-native-wasm';
-          import './wasm/qrs.generated';   // ← Polygen generates this file
-
-          // Your original App code starts here
-          import React from 'react';
-          import { SafeAreaView, Text, View } from 'react-native';
-
-          const App = () => {
-            return (
-              <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-                <Text>QRS App with Python WASM is running!</Text>
-              </SafeAreaView>
-            );
-          };
-
-          export default App;
-          EOF
-
-          echo "App.tsx patched successfully"
-
-      # ────────────────────── 5. Build Android AAB ──────────────────────
-      - name: Build Android Bundle
-        run: |
-          cd qrs-android/android
-          ./gradlew clean bundleRelease
-
-      # ────────────────────── 6. Upload to Google Play Internal ──────────────────────
-      - name: Upload to Play Store (Internal)
-        uses: r0adkll/upload-google-play@v1
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
-          serviceAccountJson: ${{ secrets.PLAY_STORE_KEY }}
-          packageName: com.chaosresonance.qrs
-          releaseFiles: qrs-android/android/app/build/outputs/bundle/release/app-release.aab
-          track: internal
+          name: secure-llm-roadscanner-debug-apk
+          path: bin/*.apk

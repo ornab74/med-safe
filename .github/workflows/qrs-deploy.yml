@@ -96,10 +96,16 @@ jobs:
       # ---- Install Buildozer & all your Python libs ----
       - name: Install Buildozer & Python dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
+
+          # IMPORTANT: p4a / pyjnius are not compatible with Cython 3 yet
+          pip install "Cython<3.0"
+
+          # Buildozer (brings in python-for-android)
+          pip install buildozer
+
+          # Your runtime deps (unchanged)
           pip install \
-            buildozer \
-            cython \
             kivy==2.2.1 \
             kivymd \
             httpx \

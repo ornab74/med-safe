@@ -21,9 +21,16 @@ version = 0.1.0
 # (str) Application version code (integer, optional but recommended)
 # android.version_code = 1
 
+# -------------------------------------------------------------
+# Python / p4a configuration
+# -------------------------------------------------------------
+
 # (list) Application requirements (python-for-android recipes)
-# NOTE: these heavy libs are kept exactly as you requested
-requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama-cpp-python
+# llama_cpp_python == your custom recipe that builds llama-cpp-python
+requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
+
+# (str) Path to your custom p4a recipes
+p4a.local_recipes = ./p4a_recipes
 
 # (str) Orientation (portrait, landscape or all)
 orientation = portrait
@@ -37,10 +44,11 @@ include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 # (list) Permissions
 android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-# ---------------- ANDROID / SDK / BUILD-TOOLS ----------------
+# -------------------------------------------------------------
+# ANDROID / SDK / BUILD-TOOLS
+# -------------------------------------------------------------
 
-# (str) Path to Android SDK (CI can override via env var)
-# On GitHub Ubuntu runners, we’ll install to /usr/local/lib/android/sdk
+# (str) Path to Android SDK (CI installs here)
 android.sdk_path = /usr/local/lib/android/sdk
 
 # (str) Path to Android NDK (optional; p4a can download if missing)
@@ -59,15 +67,15 @@ android.build_tools_version = 34.0.0
 android.archs = armeabi-v7a, arm64-v8a
 
 # (str) Bootstrap for Android
-# NOTE: android.bootstrap is deprecated → use p4a.bootstrap
+# android.bootstrap is deprecated → use p4a.bootstrap
 p4a.bootstrap = sdl2
-
-# (list) Android features if needed
-# android.features = android.hardware.camera,android.hardware.location
 
 # (str) Icon / presplash (optional)
 # icon.filename = %(source.dir)s/data/icon.png
 # presplash.filename = %(source.dir)s/data/presplash.png
+
+# (list) Android features if needed
+# android.features = android.hardware.camera,android.hardware.location
 
 # (list) Logcat filters
 android.logcat_filters = Python:V,ActivityManager:I,WindowManager:I
@@ -91,6 +99,5 @@ warn_on_root = 1
 build_dir = .buildozer
 
 # (bool) Automatically accept SDK licenses
-# This still needs to be handled in CI with sdkmanager
-# but leaving this here is fine as a hint
+# (CI still calls `yes | sdkmanager --licenses`)
 # android.accept_sdk_license = True

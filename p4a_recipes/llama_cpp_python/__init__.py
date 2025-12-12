@@ -9,17 +9,15 @@ class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
     version = "0.3.2"
 
-    # PyPI sdist includes vendored llama.cpp
-    url = (
-        "https://files.pythonhosted.org/packages/source/l/llama_cpp_python/"
-        "llama_cpp_python-{version}.tar.gz"
-    )
+    # PyPI sdist (0.3.2) - exact URL from https://pypi.org/simple/llama-cpp-python/
+    # This avoids the 404 you were hitting with the wrong /packages/source/... folder path.
+    url = "https://files.pythonhosted.org/packages/5f/0e/ff129005a33b955088fc7e4ecb57e5500b604fb97eca55ce8688dbe59680/llama_cpp_python-0.3.2.tar.gz"
 
     depends = ["python3"]
     python_depends = []
 
-    # IMPORTANT: installed top-level module is "llama_cpp", not "llama_cpp_python"
-    # p4a uses this to decide whether install can be skipped. :contentReference[oaicite:3]{index=3}
+    # Installed top-level module folder is "llama_cpp"
+    # (p4a uses this to detect whether installation can be skipped). :contentReference[oaicite:2]{index=2}
     site_packages_name = "llama_cpp"
 
     call_hostpython_via_targetpython = False
@@ -30,35 +28,32 @@ class LlamaCppPythonRecipe(Recipe):
 
         cmake_args = env.get("CMAKE_ARGS", "")
 
-        # llama.cpp options can be set via CMAKE_ARGS. :contentReference[oaicite:4]{index=4}
-        # Keep build minimal
+        # llama.cpp options can be set via CMAKE_ARGS in llama-cpp-python installs. :contentReference[oaicite:3]{index=3}
         cmake_args += " -DLLAMA_BUILD_EXAMPLES=OFF"
         cmake_args += " -DLLAMA_BUILD_TESTS=OFF"
         cmake_args += " -DLLAMA_BUILD_SERVER=OFF"
 
-        # Android NDK cross-compile guidance from llama.cpp: :contentReference[oaicite:5]{index=5}
+        # Android-friendly / CPU-only
         cmake_args += " -DGGML_OPENMP=OFF"
         cmake_args += " -DGGML_LLAMAFILE=OFF"
         cmake_args += " -DGGML_NATIVE=OFF"
 
-        # CPU-only (disable GPU backends explicitly)
         cmake_args += " -DGGML_CUDA=OFF"
         cmake_args += " -DGGML_VULKAN=OFF"
         cmake_args += " -DGGML_OPENCL=OFF"
         cmake_args += " -DGGML_METAL=OFF"
 
-        # Match llama.cpp android.md recommendation for modern devices. :contentReference[oaicite:6]{index=6}
         if getattr(arch, "arch", None) == "arm64-v8a":
             cmake_args += ' -DCMAKE_C_FLAGS="-march=armv8.7a"'
             cmake_args += ' -DCMAKE_CXX_FLAGS="-march=armv8.7a"'
 
         env["CMAKE_ARGS"] = cmake_args.strip()
 
-        # If p4a injects -Werror flags, this keeps common “implicit” warnings from killing the build.
+        # If p4a injects -Werror flags, this helps avoid common "implicit" warnings killing the build.
         for k in ("CFLAGS", "CXXFLAGS"):
             env[k] = (env.get(k, "") + " -Wno-error=implicit-function-declaration -Wno-error=implicit-int").strip()
 
-        # Some llama-cpp-python setups use FORCE_CMAKE to ensure cmake is used.
+        # Forces the cmake-based build path when applicable
         env.setdefault("FORCE_CMAKE", "1")
 
         return env
@@ -68,7 +63,6 @@ class LlamaCppPythonRecipe(Recipe):
 
         env = self.get_recipe_env(arch)
         build_dir = self.get_build_dir(arch)
-
         hostpython_cmd = sh.Command(self.ctx.hostpython)
 
         with current_directory(build_dir):

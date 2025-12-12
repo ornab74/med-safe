@@ -68,7 +68,7 @@ android.minapi = 21
 android.build_tools_version = 34.0.0
 
 # (str) Architectures
-android.archs = armeabi-v7a, arm64-v8a
+android.archs = arm64-v8a
 
 # (str) Bootstrap for Android
 p4a.bootstrap = sdl2

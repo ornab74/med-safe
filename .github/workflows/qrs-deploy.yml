@@ -1,126 +1,111 @@
-name: Build Android APK
+[app]
 
-on:
-  push:
-    branches: [ main ]
-  pull_request:
+# (str) Title of your application
+title = Secure LLM Road Scanner
 
-jobs:
-  build:
-    runs-on: ubuntu-22.04
+# (str) Package name (no dots, all lowercase)
+package.name = securellmroads
 
-    env:
-      # Use the same paths Buildozer/p4a expect
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_NDK_HOME: /usr/local/lib/android/ndk
+# (str) Package domain (reverse-DNS style, must be valid)
+package.domain = com.qroadscan
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# (str) Source code directory (where main.py lives)
+source.dir = .
 
-      # ---- JDK 17 (needed by recent cmdline-tools / sdkmanager) ----
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+# (str) Main .py file
+source.main = main.py
 
-      - name: Show Java version
-        run: |
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
+# (str) Application version
+version = 0.1.0
 
-      # ---- Python & system deps ----
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+# (str) Application version code (integer, optional)
+# android.version_code = 1
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential git zip unzip \
-            libssl-dev libffi-dev libsqlite3-dev \
-            libbz2-dev zlib1g-dev \
-            libncurses5-dev libgdbm-dev libnss3-dev \
-            libreadline-dev libffi-dev liblzma-dev \
-            libjpeg-dev libfreetype6-dev
 
-      # ---- Install Android SDK cmdline-tools into /usr/local/lib/android/sdk ----
-      - name: Install Android SDK (cmdline-tools)
-        run: |
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          cd "$ANDROID_SDK_ROOT/cmdline-tools"
+# ---------------------------------------------------------
+#  PYTHON / p4a REQUIREMENTS
+# ---------------------------------------------------------
+# NOTE:
+# - We KEEP all the libraries you listed.
+# - Instead of the pip name "llama-cpp-python", we use a
+#   custom p4a recipe name "llama_cpp_python".
+#   That recipe will in turn download/build llama-cpp-python
+#   for Android.
+requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 
-          # download commandline-tools
-          curl -o cmdline-tools.zip \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+# Tell python-for-android where our custom recipes live
+p4a.local_recipes = ./p4a_recipes
 
-          # unzip into tmp, then move inner cmdline-tools -> latest
-          mkdir -p tmp
-          unzip -q cmdline-tools.zip -d tmp
-          rm cmdline-tools.zip
+# Optionally pin p4a branch (recommended for CMake recipes)
+# p4a.branch = master
 
-          # structure after unzip: tmp/cmdline-tools/...
-          rm -rf latest
-          mv tmp/cmdline-tools latest
-          rmdir tmp
+# (str) Orientation (portrait, landscape or all)
+orientation = portrait
 
-          # create legacy tools/bin for Buildozer/p4a (expects tools/bin/sdkmanager)
-          mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
-          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
-          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" "$ANDROID_SDK_ROOT/tools/bin/avdmanager"
+# (bool) Fullscreen mode (0 or 1)
+fullscreen = 0
 
-          # debug
-          ls -R "$ANDROID_SDK_ROOT"
+# (list) Files/patterns to include in the APK
+include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 
-          # expose to later steps
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/emulator" >> $GITHUB_PATH
+# (list) Permissions
+android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-      - name: Install Android platforms / build-tools
-        run: |
-          which sdkmanager || echo "sdkmanager not in PATH!"
-          sdkmanager --version || true
 
-          yes | sdkmanager --licenses || true
-          yes | sdkmanager \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+# ---------------------------------------------------------
+#  ANDROID / SDK / BUILD-TOOLS
+# ---------------------------------------------------------
 
-      # ---- Install Buildozer & all your Python libs ----
-      - name: Install Buildozer & Python dependencies
-        run: |
-          python -m pip install --upgrade pip wheel setuptools
+# (str) Path to Android SDK
+# On GitHub Ubuntu runners we install to /usr/local/lib/android/sdk
+android.sdk_path = /usr/local/lib/android/sdk
 
-          # IMPORTANT: p4a / pyjnius are not compatible with Cython 3 yet
-          pip install "Cython<3.0"
+# (str) Optional explicit NDK path (CI sets this)
+android.ndk_path = /usr/local/lib/android/ndk
 
-          # Buildozer (brings in python-for-android)
-          pip install buildozer
+# (int) Android API to build against
+android.api = 34
 
-          # Your runtime deps (unchanged)
-          pip install \
-            kivy==2.2.1 \
-            kivymd \
-            httpx \
-            cryptography \
-            aiosqlite \
-            psutil \
-            pennylane \
-            llama-cpp-python
+# (int) Minimum supported Android API
+android.minapi = 21
 
-      - name: Export Android env vars
-        run: |
-          echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          echo "ANDROIDNDK=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+# (str) Build-tools version
+android.build_tools_version = 34.0.0
 
-      # ---- Build debug APK ----
-      - name: Build debug APK
-        run: |
-          buildozer android debug
+# (str) Architectures
+android.archs = armeabi-v7a, arm64-v8a
+
+# (str) Bootstrap for Android
+# android.bootstrap is deprecated → use p4a.bootstrap
+p4a.bootstrap = sdl2
+
+# (list) Android features if needed
+# android.features = android.hardware.camera,android.hardware.location
+
+# (str) Icon / presplash (optional)
+# icon.filename = %(source.dir)s/data/icon.png
+# presplash.filename = %(source.dir)s/data/presplash.png
+
+# (list) Logcat filters
+android.logcat_filters = Python:V,ActivityManager:I,WindowManager:I
+
+# (bool) Disallow/allow backup
+android.allow_backup = False
+
+
+[buildozer]
+
+# (int) Log level (0 quiet, 1 normal, 2 verbose, 3 debug)
+log_level = 2
+
+# (bool) Warn if running as root
+warn_on_root = 1
+
+# (str) Default command when running just `buildozer`
+# default_command = android debug
+
+# (str) Directory where to store compiled parts
+build_dir = .buildozer
+
+# Auto-accept SDK licenses (CI still runs sdkmanager --licenses)
+android.accept_sdk_license = True

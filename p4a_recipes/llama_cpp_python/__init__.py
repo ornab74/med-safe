@@ -89,6 +89,7 @@ class LlamaCppPythonRecipe(Recipe):
                 "ninja",
                 "typing_extensions",
                 "numpy==1.26.4",
+                "flit-core",
                 _env=env,
             )
 

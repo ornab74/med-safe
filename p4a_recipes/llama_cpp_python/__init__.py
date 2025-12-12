@@ -1,59 +1,74 @@
-from pythonforandroid.recipe import CMakePythonRecipe
+import os
+
+from pythonforandroid.recipe import PythonRecipe
+from pythonforandroid.toolchain import current_directory, shprint
+import sh
 
 
-class LlamaCppPythonRecipe(CMakePythonRecipe):
+class LlamaCppPythonRecipe(PythonRecipe):
     """
-    Custom python-for-android recipe that builds llama-cpp-python
-    for Android using CMake.
+    Custom recipe to build llama-cpp-python for Android.
 
-    It corresponds to the pip package "llama-cpp-python", but the
-    recipe name is "llama_cpp_python" (underscores), which is what
-    we use in buildozer.spec requirements.
+    NOTE:
+      - We subclass PythonRecipe (available in all recent p4a versions),
+        NOT CMakePythonRecipe (which your version doesn’t have).
+      - We override get_recipe_env to inject CMake / Android flags so the
+        package’s own CMakeLists can try to cross-compile for Android.
+      - This is a best-effort starting point; you may still need to tune
+        flags if CMake complains in later steps.
     """
 
-    # Pick a version that works for you; keep in sync with the model code.
-    version = "0.3.0"
-    url = "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/v{version}.zip"
-
-    # p4a "logical" name; MUST match buildozer.spec requirements
     name = "llama_cpp_python"
+    version = "0.2.83"  # pick any version you like
+    url = "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/v{version}.tar.gz"
 
-    # Base dependencies
-    depends = ["python3"]
-    python_depends = []
+    # Keep it light: setuptools + wheel + numpy if needed
+    depends = ["setuptools", "wheel"]
 
-    # Python import / site-packages name
-    site_packages_name = "llama_cpp_python"
-
-    # Don’t run hostpython under targetpython wrapper
+    # Let targetpython run pip directly
     call_hostpython_via_targetpython = False
 
-    # Install into site-packages on the target
-    install_in_site_packages = True
+    def get_recipe_env(self, arch):
+        # Start from the default env
+        env = super().get_recipe_env(arch)
 
-    def get_cmake_args(self, arch):
+        # Paths / versions from the p4a context
+        ndk_dir = self.ctx.ndk_dir
+        api = self.ctx.ndk_api
+
+        # llama-cpp-python respects these environment variables
+        # when building with CMake
+        env["FORCE_CMAKE"] = "1"
+
+        # Generic CMake Android config
+        env["CMAKE_SYSTEM_NAME"] = "Android"
+        env["CMAKE_ANDROID_NDK"] = ndk_dir
+        env["CMAKE_SYSTEM_VERSION"] = str(api)
+        env["CMAKE_ANDROID_ARCH_ABI"] = arch.arch
+        env["CMAKE_ANDROID_STL_TYPE"] = "c++_static"
+
+        # Disable GPU / BLAS backends to simplify the build
+        env["LLAMA_CUBLAS"] = "0"
+        env["LLAMA_CLBLAST"] = "0"
+        env["LLAMA_METAL"] = "0"
+        env["LLAMA_OPENBLAS"] = "0"
+        env["LLAMA_BLAS"] = "0"
+
+        # This can help CMake find the toolchain
+        env["ANDROID_NDK"] = ndk_dir
+        env["ANDROIDAPI"] = str(api)
+
+        return env
+
+    def build_arch(self, arch):
         """
-        Extra CMake flags to make the build more Android-friendly:
-        - disable GPU backends
-        - disable tests/examples
-        - set Android ABI + platform
+        We just reuse PythonRecipe's build_arch, which uses pip to build
+        the extension, but with our tweaked env above.
         """
-        args = [
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DLLAMA_CUBLAS=OFF",
-            "-DLLAMA_CLBLAST=OFF",
-            "-DLLAMA_METAL=OFF",
-            "-DLLAMA_OPENBLAS=OFF",
-            "-DLLAMA_ACCELERATE=OFF",
-            "-DLLAMA_F16C=OFF",
-            "-DLLAMA_NATIVE=OFF",
-            "-DLLAMA_BUILD_EXAMPLES=OFF",
-            "-DLLAMA_BUILD_TESTS=OFF",
-            # Android target
-            f"-DANDROID_ABI={arch.arch}",
-            f"-DANDROID_PLATFORM=android-{self.ctx.ndk_api}",
-        ]
-        return args
+        # Optional: debug info
+        build_dir = self.get_build_dir(arch)
+        shprint(sh.echo, f"[llama_cpp_python] building in {build_dir} for {arch.arch}")
+        super().build_arch(arch)
 
 
 recipe = LlamaCppPythonRecipe()

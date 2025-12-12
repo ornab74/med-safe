@@ -9,8 +9,11 @@ class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
     version = "0.3.2"
 
-    # Exact 0.3.2 sdist URL (avoids 404 from wrong /packages/source/... path)
-    url = "https://files.pythonhosted.org/packages/5f/0e/ff129005a33b955088fc7e4ecb57e5500b604fb97eca55ce8688dbe59680/llama_cpp_python-0.3.2.tar.gz"
+    # Use correct PyPI project path (llama-cpp-python). This avoids the 404 you hit.
+    url = (
+        "https://files.pythonhosted.org/packages/source/l/llama-cpp-python/"
+        "llama_cpp_python-{version}.tar.gz"
+    )
 
     depends = ["python3"]
     python_depends = []
@@ -27,7 +30,6 @@ class LlamaCppPythonRecipe(Recipe):
         """
         env = dict(base_env)
 
-        # Remove common cross-compile variables p4a sets
         for k in (
             "CC", "CXX", "AR", "AS", "LD", "STRIP", "RANLIB",
             "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
@@ -35,51 +37,64 @@ class LlamaCppPythonRecipe(Recipe):
         ):
             env.pop(k, None)
 
-        # Ensure user site is enabled (pip may default to --user if site-packages isn't writable)
+        # Keep user site enabled
         env["PYTHONNOUSERSITE"] = "0"
+        env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        env.setdefault("PIP_NO_INPUT", "1")
         return env
 
     def get_recipe_env(self, arch):
         env = super().get_recipe_env(arch)
 
+        # unicode.cpp uses deprecated codecvt on Android NDK/libc++
+        # Don’t let warnings kill the build; and re-enable removed codecvt pieces if needed.
+        cxx_silence = (
+            "-Wno-deprecated-declarations "
+            "-Wno-error=deprecated-declarations "
+            "-D_LIBCPP_ENABLE_CXX17_REMOVED_CODECVT"
+        )
+
         cmake_args = env.get("CMAKE_ARGS", "")
 
-        # llama-cpp-python forwards llama.cpp options via CMAKE_ARGS :contentReference[oaicite:1]{index=1}
+        # llama-cpp-python forwards llama.cpp CMake options via CMAKE_ARGS
         cmake_args += " -DLLAMA_BUILD_EXAMPLES=OFF"
         cmake_args += " -DLLAMA_BUILD_TESTS=OFF"
         cmake_args += " -DLLAMA_BUILD_SERVER=OFF"
 
-        # Android/CPU-friendly
+        # Android/CPU-friendly (matches llama.cpp NDK cross-compile guidance)
         cmake_args += " -DGGML_OPENMP=OFF"
         cmake_args += " -DGGML_LLAMAFILE=OFF"
         cmake_args += " -DGGML_NATIVE=OFF"
 
+        # CPU-only
         cmake_args += " -DGGML_CUDA=OFF"
         cmake_args += " -DGGML_VULKAN=OFF"
         cmake_args += " -DGGML_OPENCL=OFF"
         cmake_args += " -DGGML_METAL=OFF"
 
-        # Make build logs much louder
         cmake_args += " -DCMAKE_VERBOSE_MAKEFILE=ON"
 
-        # Optional: modern ARM64 tuning (only for arm64)
+        # Apply flags (don’t overwrite -march without also including cxx_silence)
         if getattr(arch, "arch", None) == "arm64-v8a":
+            # llama.cpp suggests -march=armv8.7a for modern devices
             cmake_args += ' -DCMAKE_C_FLAGS="-march=armv8.7a"'
-            cmake_args += ' -DCMAKE_CXX_FLAGS="-march=armv8.7a"'
+            cmake_args += f' -DCMAKE_CXX_FLAGS="-march=armv8.7a {cxx_silence}"'
+        else:
+            cmake_args += f' -DCMAKE_CXX_FLAGS="{cxx_silence}"'
 
         env["CMAKE_ARGS"] = cmake_args.strip()
 
-        # Keep user-site enabled
         env["PYTHONNOUSERSITE"] = "0"
 
-        # Reduce “implicit *” warnings killing the build under strict flags
+        # Reduce strict -Werror pain from p4a toolchains
         for k in ("CFLAGS", "CXXFLAGS"):
-            env[k] = (env.get(k, "") + " -Wno-error=implicit-function-declaration -Wno-error=implicit-int").strip()
+            env[k] = (
+                env.get(k, "")
+                + " -Wno-error=implicit-function-declaration -Wno-error=implicit-int "
+                + " -Wno-deprecated-declarations -Wno-error=deprecated-declarations"
+            ).strip()
 
-        # Helps for some llama-cpp-python builds
         env.setdefault("FORCE_CMAKE", "1")
-
-        # scikit-build-core respects CMAKE_ARGS; verbose helps debug :contentReference[oaicite:2]{index=2}
         env.setdefault("SKBUILD_VERBOSE", "1")
 
         return env
@@ -91,28 +106,25 @@ class LlamaCppPythonRecipe(Recipe):
         build_dir = self.get_build_dir(arch)
         hostpython_cmd = sh.Command(self.ctx.hostpython)
 
-        # Put all pip-installed tooling in a writable per-arch userbase
-        userbase = os.path.join(build_dir, "_hostpython_userbase")
-        os.makedirs(userbase, exist_ok=True)
-        target_env["PYTHONUSERBASE"] = userbase
-
         host_env = self._host_tools_env(target_env)
-        host_env["PYTHONUSERBASE"] = userbase
 
         with current_directory(build_dir):
-            # 1) Ensure pip exists (hostpython often has no pip)
-            # ensurepip is the stdlib way to bootstrap pip :contentReference[oaicite:3]{index=3}
-            info("[llama_cpp_python] bootstrapping pip via ensurepip")
-            shprint(hostpython_cmd, "-m", "ensurepip", "--upgrade", "--default-pip", _env=host_env)
+            # Use a venv so build backends (flit-core/scikit-build-core) are always importable/writable.
+            # (--no-build-isolation means *you* must supply build requirements.)
+            venv_dir = os.path.join(build_dir, "_hostpython_venv")
+            venv_python = os.path.join(venv_dir, "bin", "python")
 
-            # 2) Install build backends/tools needed for pyproject build
-            # With --no-build-isolation, build requirements must already be present :contentReference[oaicite:4]{index=4}
-            info("[llama_cpp_python] installing build backends/tools (host env)")
+            if not os.path.exists(venv_python):
+                info("[llama_cpp_python] creating venv for build tooling")
+                shprint(hostpython_cmd, "-m", "ensurepip", "--upgrade", "--default-pip", _env=host_env)
+                shprint(hostpython_cmd, "-m", "venv", venv_dir, _env=host_env)
+
+            vpy = sh.Command(venv_python)
+
+            # Install pyproject build backends/tools (flit-core provides flit_core.buildapi)
+            info("[llama_cpp_python] installing build backends/tools in venv")
             shprint(
-                hostpython_cmd,
-                "-m", "pip", "install",
-                "--user",
-                "--upgrade",
+                vpy, "-m", "pip", "install", "--upgrade",
                 "pip",
                 "setuptools",
                 "wheel",
@@ -125,16 +137,14 @@ class LlamaCppPythonRecipe(Recipe):
                 _env=host_env,
             )
 
-            # Quick sanity check for the flit backend import
-            shprint(hostpython_cmd, "-c", "import flit_core.buildapi; print('flit_core OK')", _env=host_env)
+            # Sanity check
+            shprint(vpy, "-c", "import flit_core.buildapi; print('flit_core OK')", _env=host_env)
 
-            # 3) Build + install package for target (verbose, no deps)
-            # (p4a generally prefers handling deps itself; --no-deps avoids extra noise)
+            # Build + install for target (cross-compile vars are in target_env)
             info("[llama_cpp_python] building+installing (target env, very verbose)")
             shprint(
-                hostpython_cmd,
+                vpy,
                 "-m", "pip", "install",
-                "--user",
                 "-vvv",
                 ".",
                 "--no-deps",

@@ -1,66 +1,62 @@
-# p4a_recipes/llama_cpp_python/__init__.py
-
-from pythonforandroid.recipe import PythonRecipe
+from pythonforandroid.recipe import Recipe
 from pythonforandroid.util import current_directory
 from pythonforandroid.logger import info, shprint
 import sh
 
 
-class LlamaCppPythonRecipe(PythonRecipe):
-    # visible name used in buildozer.spec "requirements"
+class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
-
-    # pick a version you know works for you
     version = "0.3.2"
     url = (
         "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
         "v{version}.tar.gz"
     )
 
-    # p4a deps
+    # p4a dependencies
     depends = ["python3"]
     python_depends = []
 
-    # how it will be installed into site-packages
+    # name inside site-packages
     site_packages_name = "llama_cpp_python"
 
-    # we explicitly drive hostpython, so don’t proxy via targetpython
+    # we drive hostpython directly, not via targetpython
     call_hostpython_via_targetpython = False
-
-    def get_recipe_env(self, arch):
-        # start from the standard PythonRecipe env (gives us CC, CXX, NDK paths)
-        env = super().get_recipe_env(arch)
-
-        # IMPORTANT: let the pyproject build see our tools instead of
-        # creating its own isolated venv where cmake/ninja aren't installed
-        env["PIP_NO_BUILD_ISOLATION"] = "1"
-
-        # hint for scikit-build-core
-        env.setdefault("SKBUILD_CMAKE_GENERATOR", "Ninja")
-
-        return env
 
     def build_arch(self, arch):
         info(f"[llama_cpp_python] building for arch {arch}")
 
+        # p4a env for this recipe/arch (sets CC, CXX, CFLAGS, etc.)
         env = self.get_recipe_env(arch)
-        # PythonRecipe gives us a usable interpreter path for hostpython
-        hostpython_path = self.get_hostpython(arch)
-        hostpython = sh.Command(hostpython_path)
 
+        # directory where p4a unpacked the tarball
         build_dir = self.get_build_dir(arch)
 
-        with current_directory(build_dir):
-            # --- make sure hostpython has pip itself -------------------------
-            try:
-                shprint(hostpython, "-m", "pip", "--version", _env=env)
-            except sh.ErrorReturnCode:
-                # bootstrap pip into this interpreter if it’s missing
-                shprint(hostpython, "-m", "ensurepip", "--upgrade", _env=env)
+        # hostpython executable path from the toolchain context
+        hostpython_cmd = sh.Command(self.ctx.hostpython)
 
-            # --- core build tools (keep them ALL, as you asked) --------------
+        with current_directory(build_dir):
+            # --------------------------------------------------
+            # 1) Make sure hostpython has pip
+            # --------------------------------------------------
+            try:
+                shprint(hostpython_cmd, "-m", "pip", "--version", _env=env)
+            except sh.ErrorReturnCode:
+                # bootstrap pip into hostpython
+                info("[llama_cpp_python] bootstrapping pip via ensurepip")
+                shprint(
+                    hostpython_cmd,
+                    "-m",
+                    "ensurepip",
+                    "--upgrade",
+                    _env=env,
+                )
+
+            # --------------------------------------------------
+            # 2) Install / upgrade all build tools **inside hostpython**
+            # --------------------------------------------------
+            info("[llama_cpp_python] installing build tools (pip, wheel, cmake, ninja...)")
             shprint(
-                hostpython,
+                hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
@@ -68,35 +64,28 @@ class LlamaCppPythonRecipe(PythonRecipe):
                 "pip",
                 "setuptools",
                 "wheel",
-                _env=env,
-            )
-
-            # tools used by llama-cpp-python’s pyproject/scikit-build
-            shprint(
-                hostpython,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
+                "scikit-build-core",
                 "cmake",
                 "ninja",
-                "scikit-build-core",
                 _env=env,
             )
 
-            # --- finally build llama-cpp-python itself -----------------------
-            # --no-binary :all: forces a full C/C++ build using our NDK + CMake.
+            # --------------------------------------------------
+            # 3) Build llama-cpp-python from source for this arch
+            # --------------------------------------------------
+            info("[llama_cpp_python] building and installing from source")
             shprint(
-                hostpython,
+                hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
-                ".",
+                ".",                    # current source tree
                 "--no-binary",
-                ":all:",
+                ":all:",                # force from-source build
+                "--no-build-isolation", # reuse the tools we just installed
                 _env=env,
             )
 
 
-# p4a entry-point
+# p4a entry point
 recipe = LlamaCppPythonRecipe()

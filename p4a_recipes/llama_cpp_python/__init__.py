@@ -68,6 +68,7 @@ class LlamaCppPythonRecipe(Recipe):
                 "cmake",
                 "flit_core",
                 "scikit-build-core",
+                "meson-python",
                 "ninja",
                 _env=env,
             )

@@ -21,22 +21,18 @@ version = 0.1.0
 # (str) Application version code (integer, optional)
 # android.version_code = 1
 
-
 # ---------------------------------------------------------
 #  PYTHON / p4a REQUIREMENTS
 # ---------------------------------------------------------
-# NOTE:
-# - We KEEP all the libraries you listed.
-# - Instead of the pip name "llama-cpp-python", we use a
-#   custom p4a recipe name "llama_cpp_python".
-#   That recipe will in turn download/build llama-cpp-python
-#   for Android.
+# We KEEP all the heavy libs.
+# llama_cpp_python is a custom p4a recipe that builds
+# the pip package llama-cpp-python for Android.
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 
 # Tell python-for-android where our custom recipes live
 p4a.local_recipes = ./p4a_recipes
 
-# Optionally pin p4a branch (recommended for CMake recipes)
+# Optionally pin a p4a branch if you want
 # p4a.branch = master
 
 # (str) Orientation (portrait, landscape or all)
@@ -51,17 +47,16 @@ include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 # (list) Permissions
 android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-
 # ---------------------------------------------------------
 #  ANDROID / SDK / BUILD-TOOLS
 # ---------------------------------------------------------
 
-# (str) Path to Android SDK
-# On GitHub Ubuntu runners we install to /usr/local/lib/android/sdk
+# Android SDK path (we install it here in the workflow)
 android.sdk_path = /usr/local/lib/android/sdk
 
-# (str) Optional explicit NDK path (CI sets this)
-android.ndk_path = /usr/local/lib/android/ndk
+# ❌ DO NOT set android.ndk_path on CI, it causes permission errors.
+# Let Buildozer download & keep the NDK under .buildozer.
+# android.ndk_path = /usr/local/lib/android/ndk
 
 # (int) Android API to build against
 android.api = 34
@@ -76,13 +71,12 @@ android.build_tools_version = 34.0.0
 android.archs = armeabi-v7a, arm64-v8a
 
 # (str) Bootstrap for Android
-# android.bootstrap is deprecated → use p4a.bootstrap
 p4a.bootstrap = sdl2
 
 # (list) Android features if needed
 # android.features = android.hardware.camera,android.hardware.location
 
-# (str) Icon / presplash (optional)
+# Icon / presplash (optional)
 # icon.filename = %(source.dir)s/data/icon.png
 # presplash.filename = %(source.dir)s/data/presplash.png
 

@@ -70,7 +70,7 @@ class LlamaCppPythonRecipe(Recipe):
                 "scikit-build-core",
                 "meson-python",
                 "typing_extensions",
-                "numpy==1.26.4"
+                "numpy==1.26.4",
                 "ninja",
                 _env=env,
             )

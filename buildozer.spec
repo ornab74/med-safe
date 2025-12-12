@@ -18,19 +18,26 @@ source.main = main.py
 # (str) Application version
 version = 0.1.0
 
-# (str) Application version code (integer, optional but recommended)
+# (str) Application version code (integer, optional)
 # android.version_code = 1
 
-# -------------------------------------------------------------
-# Python / p4a configuration
-# -------------------------------------------------------------
 
-# (list) Application requirements (python-for-android recipes)
-# llama_cpp_python == your custom recipe that builds llama-cpp-python
+# ---------------------------------------------------------
+#  PYTHON / p4a REQUIREMENTS
+# ---------------------------------------------------------
+# NOTE:
+# - We KEEP all the libraries you listed.
+# - Instead of the pip name "llama-cpp-python", we use a
+#   custom p4a recipe name "llama_cpp_python".
+#   That recipe will in turn download/build llama-cpp-python
+#   for Android.
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 
-# (str) Path to your custom p4a recipes
+# Tell python-for-android where our custom recipes live
 p4a.local_recipes = ./p4a_recipes
+
+# Optionally pin p4a branch (recommended for CMake recipes)
+# p4a.branch = master
 
 # (str) Orientation (portrait, landscape or all)
 orientation = portrait
@@ -44,15 +51,17 @@ include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 # (list) Permissions
 android.permissions = INTERNET,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE
 
-# -------------------------------------------------------------
-# ANDROID / SDK / BUILD-TOOLS
-# -------------------------------------------------------------
 
-# (str) Path to Android SDK (CI installs here)
+# ---------------------------------------------------------
+#  ANDROID / SDK / BUILD-TOOLS
+# ---------------------------------------------------------
+
+# (str) Path to Android SDK
+# On GitHub Ubuntu runners we install to /usr/local/lib/android/sdk
 android.sdk_path = /usr/local/lib/android/sdk
 
-# (str) Path to Android NDK (optional; p4a can download if missing)
-# android.ndk_path = /usr/local/lib/android/ndk
+# (str) Optional explicit NDK path (CI sets this)
+android.ndk_path = /usr/local/lib/android/ndk
 
 # (int) Android API to build against
 android.api = 34
@@ -70,12 +79,12 @@ android.archs = armeabi-v7a, arm64-v8a
 # android.bootstrap is deprecated → use p4a.bootstrap
 p4a.bootstrap = sdl2
 
+# (list) Android features if needed
+# android.features = android.hardware.camera,android.hardware.location
+
 # (str) Icon / presplash (optional)
 # icon.filename = %(source.dir)s/data/icon.png
 # presplash.filename = %(source.dir)s/data/presplash.png
-
-# (list) Android features if needed
-# android.features = android.hardware.camera,android.hardware.location
 
 # (list) Logcat filters
 android.logcat_filters = Python:V,ActivityManager:I,WindowManager:I
@@ -98,6 +107,5 @@ warn_on_root = 1
 # (str) Directory where to store compiled parts
 build_dir = .buildozer
 
-# (bool) Automatically accept SDK licenses
-# (CI still calls `yes | sdkmanager --licenses`)
-# android.accept_sdk_license = True
+# Auto-accept SDK licenses (CI still runs sdkmanager --licenses)
+android.accept_sdk_license = True

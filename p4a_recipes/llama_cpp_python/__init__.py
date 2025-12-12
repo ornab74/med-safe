@@ -1,30 +1,20 @@
 from pythonforandroid.recipe import Recipe
-from pythonforandroid.util import current_directory, shprint
-from pythonforandroid.logger import info
+from pythonforandroid.util import current_directory
+from pythonforandroid.logger import info, shprint
 import sh  # p4a uses 'sh' under the hood
 
 
 class LlamaCppPythonRecipe(Recipe):
-    """
-    Minimal pyproject-style recipe for llama-cpp-python.
-
-    We let pip + the p4a toolchain do the heavy lifting:
-    - install cmake/ninja into the hostpython env
-    - pip install .  (which builds C++ with the NDK toolchain)
-    """
-
     name = "llama_cpp_python"
-    # pick a known-good version; adjust if you like
     version = "0.3.2"
     url = (
         "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
         "v{version}.tar.gz"
     )
 
-    # pure python deps handled by pip inside build_arch
+    # p4a deps
     depends = ["python3"]
     python_depends = []
-
     site_packages_name = "llama_cpp_python"
     call_hostpython_via_targetpython = False
 
@@ -34,11 +24,35 @@ class LlamaCppPythonRecipe(Recipe):
         hostpython = self.get_hostpython(arch)
         build_dir = self.get_build_dir(arch)
 
-        with current_directory(build_dir):
-            # make sure build tools exist in the hostpython env
-            shprint(hostpython, "-m", "pip", "install", "cmake", "ninja", _env=env)
+        # Make sure we don’t accidentally try to build CUDA/cuBLAS stuff on Android
+        env.setdefault("CMAKE_ARGS", "")
+        env["CMAKE_ARGS"] += (
+            " -DLLAMA_CUBLAS=OFF"
+            " -DLLAMA_CUDA=OFF"
+            " -DLLAMA_OPENBLAS=OFF"
+        )
+        env["LLAMA_CUBLAS"] = "0"
+        env["LLAMA_CUDA"] = "0"
+        env["LLAMA_OPENBLAS"] = "0"
 
-            # build from source for this arch, no prebuilt wheels
+        with current_directory(build_dir):
+            # --- Build toolchain for pyproject / CMake build ---
+            # Install everything needed to compile llama-cpp-python from source
+            shprint(
+                hostpython,
+                "-m",
+                "pip",
+                "install",
+                "cmake",
+                "ninja",
+                "scikit-build-core",
+                "setuptools",
+                "wheel",
+                "packaging",
+                _env=env,
+            )
+
+            # --- Actual build/install for this arch ---
             shprint(
                 hostpython,
                 "-m",

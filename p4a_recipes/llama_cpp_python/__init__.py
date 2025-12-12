@@ -1,83 +1,59 @@
-from pythonforandroid.recipe import Recipe
-from pythonforandroid.logger import shprint
-from pythonforandroid.toolchain import current_directory, sh
-import os
+from pythonforandroid.recipe import CMakePythonRecipe
 
 
-class LlamaCppPythonRecipe(Recipe):
+class LlamaCppPythonRecipe(CMakePythonRecipe):
     """
-    Custom recipe to build llama-cpp-python for Android.
+    Custom python-for-android recipe that builds llama-cpp-python
+    for Android using CMake.
 
-    - Uses pyproject / CMake via `pip install .`
-    - Builds directly for the target arch using the NDK toolchain env
+    It corresponds to the pip package "llama-cpp-python", but the
+    recipe name is "llama_cpp_python" (underscores), which is what
+    we use in buildozer.spec requirements.
     """
 
-    # Pick a version you’re happy with (0.3.x is current-ish)
-    version = "0.3.2"
+    # Pick a version that works for you; keep in sync with the model code.
+    version = "0.3.0"
+    url = "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/v{version}.zip"
 
-    # sdist from GitHub – avoids prebuilt wheels
-    url = (
-        "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/v{version}.tar.gz"
-    )
-
-    # Name used in buildozer.spec requirements
+    # p4a "logical" name; MUST match buildozer.spec requirements
     name = "llama_cpp_python"
 
-    # p4a dependencies
+    # Base dependencies
     depends = ["python3"]
     python_depends = []
 
-    # We don’t want the default host-then-target behaviour
+    # Python import / site-packages name
+    site_packages_name = "llama_cpp_python"
+
+    # Don’t run hostpython under targetpython wrapper
     call_hostpython_via_targetpython = False
 
-    def build_arch(self, arch):
-        super().build_arch(arch)
+    # Install into site-packages on the target
+    install_in_site_packages = True
 
-        env = self.get_recipe_env(arch)
-
-        # Required for scikit-build-core / CMake builds
-        env.setdefault("CMAKE_ARGS", "")
-        env["CMAKE_ARGS"] += " -DLLAMA_CUBLAS=OFF -DLLAMA_CLBLAST=OFF"
-
-        # Extra flags for Android if needed
-        env.setdefault("CFLAGS", "")
-        env.setdefault("CXXFLAGS", "")
-        env.setdefault("LDFLAGS", "")
-
-        build_dir = self.get_build_dir(arch)
-        install_dir = self.ctx.get_python_install_dir(arch)
-
-        hostpython = self.get_hostpython(arch)
-
-        with current_directory(build_dir):
-            # Ensure pip + build tools are available in target env
-            shprint(
-                hostpython,
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "pip",
-                "setuptools",
-                "wheel",
-                "cmake",
-                "ninja",
-                _env=env,
-            )
-
-            # Build and install llama-cpp-python for the target
-            shprint(
-                hostpython,
-                "-m",
-                "pip",
-                "install",
-                ".",
-                "--no-binary",
-                ":all:",
-                "--prefix",
-                install_dir,
-                _env=env,
-            )
+    def get_cmake_args(self, arch):
+        """
+        Extra CMake flags to make the build more Android-friendly:
+        - disable GPU backends
+        - disable tests/examples
+        - set Android ABI + platform
+        """
+        args = [
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DLLAMA_CUBLAS=OFF",
+            "-DLLAMA_CLBLAST=OFF",
+            "-DLLAMA_METAL=OFF",
+            "-DLLAMA_OPENBLAS=OFF",
+            "-DLLAMA_ACCELERATE=OFF",
+            "-DLLAMA_F16C=OFF",
+            "-DLLAMA_NATIVE=OFF",
+            "-DLLAMA_BUILD_EXAMPLES=OFF",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            # Android target
+            f"-DANDROID_ABI={arch.arch}",
+            f"-DANDROID_PLATFORM=android-{self.ctx.ndk_api}",
+        ]
+        return args
 
 
 recipe = LlamaCppPythonRecipe()

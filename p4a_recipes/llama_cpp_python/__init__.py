@@ -1,90 +1,71 @@
 from pythonforandroid.recipe import Recipe
 from pythonforandroid.util import current_directory
 from pythonforandroid.logger import info, shprint
-import sh
+import sh  # p4a uses 'sh' for running commands
 
 
 class LlamaCppPythonRecipe(Recipe):
+    # Name must match what you put in buildozer.spec requirements
+    # requirements = ... ,llama_cpp_python
     name = "llama_cpp_python"
-    # you can bump this if you like, but keep a tag that exists
     version = "0.3.2"
+
+    # Standard llama-cpp-python GitHub tarball
     url = (
         "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
         "v{version}.tar.gz"
     )
 
-    # p4a deps
+    # p4a dependencies
     depends = ["python3"]
     python_depends = []
 
-    # name inside site-packages
-    site_packages_name = "llama_cpp_python"
+    # This must be the *import* name from your app:  `from llama_cpp import Llama`
+    site_packages_name = "llama_cpp"
 
-    # we want to run hostpython directly, not via targetpython
+    # We’re going to drive hostpython ourselves
     call_hostpython_via_targetpython = False
 
-    # ---------------------------------------------------------
-    # helpers
-    # ---------------------------------------------------------
-    def _ensure_pip(self, hostpython, env):
-        """
-        Make sure the hostpython used by p4a has pip available.
-        Try ensurepip first, and if that fails, fall back to get-pip.py.
-        """
-        try:
-            info("[llama_cpp_python] trying ensurepip for hostpython")
-            shprint(hostpython, "-m", "ensurepip", "--upgrade", _env=env)
-        except sh.ErrorReturnCode:
-            info(
-                "[llama_cpp_python] ensurepip not available, "
-                "bootstrapping pip via get-pip.py"
-            )
-            # download get-pip.py into the build dir
-            shprint(
-                sh.wget,
-                "https://bootstrap.pypa.io/get-pip.py",
-                "-O",
-                "get-pip.py",
-                _env=env,
-            )
-            shprint(hostpython, "get-pip.py", _env=env)
-
-    # ---------------------------------------------------------
-    # main build
-    # ---------------------------------------------------------
     def build_arch(self, arch):
-        info(f"[llama_cpp_python] build_arch for arch {arch}")
+        info(f"[llama_cpp_python] build_arch for {arch.arch}")
+
         env = self.get_recipe_env(arch)
-        # get_hostpython returns a string path – wrap it as a sh.Command
-        hostpython = sh.Command(self.get_hostpython(arch))
+
+        # p4a exposes the hostpython executable on the context
+        hostpython = sh.Command(self.ctx.hostpython)
+
         build_dir = self.get_build_dir(arch)
 
         with current_directory(build_dir):
-            # 1) make sure pip exists in this hostpython
-            self._ensure_pip(hostpython, env)
+            # 1) make sure hostpython has pip
+            shprint(hostpython, "-m", "ensurepip", "--upgrade", _env=env)
 
-            # 2) install all build tools we need into that hostpython
-            info("[llama_cpp_python] installing build tools with pip")
+            # 2) upgrade pip/setuptools/wheel (needed for pyproject builds)
             shprint(
                 hostpython,
-                "-m",
-                "pip",
+                "-m", "pip",
                 "install",
                 "--upgrade",
                 "pip",
-                "wheel",
                 "setuptools",
+                "wheel",
+                _env=env,
+            )
+
+            # 3) tools that llama-cpp-python’s build needs
+            shprint(
+                hostpython,
+                "-m", "pip",
+                "install",
                 "cmake",
                 "ninja",
                 _env=env,
             )
 
-            # 3) actually build llama-cpp-python from source for this arch
-            info("[llama_cpp_python] building/Installing llama-cpp-python via pip")
+            # 4) finally build llama-cpp-python from source for this arch
             shprint(
                 hostpython,
-                "-m",
-                "pip",
+                "-m", "pip",
                 "install",
                 ".",
                 "--no-binary",
@@ -93,5 +74,5 @@ class LlamaCppPythonRecipe(Recipe):
             )
 
 
-# required by python-for-android
+# p4a entry-point
 recipe = LlamaCppPythonRecipe()

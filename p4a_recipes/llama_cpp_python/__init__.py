@@ -69,6 +69,8 @@ class LlamaCppPythonRecipe(Recipe):
                 "flit_core",
                 "scikit-build-core",
                 "meson-python",
+                "typing_extensions",
+                "numpy==1.26.4"
                 "ninja",
                 _env=env,
             )

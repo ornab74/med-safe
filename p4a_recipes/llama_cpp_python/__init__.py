@@ -1,49 +1,68 @@
-from pythonforandroid.recipe import Recipe
+# p4a_recipes/llama_cpp_python/__init__.py
+
+from pythonforandroid.recipe import PythonRecipe
 from pythonforandroid.util import current_directory
 from pythonforandroid.logger import info, shprint
-import sh  # p4a uses 'sh' for running commands
+import sh
 
 
-class LlamaCppPythonRecipe(Recipe):
-    # Name must match what you put in buildozer.spec requirements
-    # requirements = ... ,llama_cpp_python
+class LlamaCppPythonRecipe(PythonRecipe):
+    # visible name used in buildozer.spec "requirements"
     name = "llama_cpp_python"
-    version = "0.3.2"
 
-    # Standard llama-cpp-python GitHub tarball
+    # pick a version you know works for you
+    version = "0.3.2"
     url = (
         "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
         "v{version}.tar.gz"
     )
 
-    # p4a dependencies
+    # p4a deps
     depends = ["python3"]
     python_depends = []
 
-    # This must be the *import* name from your app:  `from llama_cpp import Llama`
-    site_packages_name = "llama_cpp"
+    # how it will be installed into site-packages
+    site_packages_name = "llama_cpp_python"
 
-    # We’re going to drive hostpython ourselves
+    # we explicitly drive hostpython, so don’t proxy via targetpython
     call_hostpython_via_targetpython = False
 
+    def get_recipe_env(self, arch):
+        # start from the standard PythonRecipe env (gives us CC, CXX, NDK paths)
+        env = super().get_recipe_env(arch)
+
+        # IMPORTANT: let the pyproject build see our tools instead of
+        # creating its own isolated venv where cmake/ninja aren't installed
+        env["PIP_NO_BUILD_ISOLATION"] = "1"
+
+        # hint for scikit-build-core
+        env.setdefault("SKBUILD_CMAKE_GENERATOR", "Ninja")
+
+        return env
+
     def build_arch(self, arch):
-        info(f"[llama_cpp_python] build_arch for {arch.arch}")
+        info(f"[llama_cpp_python] building for arch {arch}")
 
         env = self.get_recipe_env(arch)
-
-        # p4a exposes the hostpython executable on the context
-        hostpython = sh.Command(self.ctx.hostpython)
+        # PythonRecipe gives us a usable interpreter path for hostpython
+        hostpython_path = self.get_hostpython(arch)
+        hostpython = sh.Command(hostpython_path)
 
         build_dir = self.get_build_dir(arch)
 
         with current_directory(build_dir):
-            # 1) make sure hostpython has pip
-            shprint(hostpython, "-m", "ensurepip", "--upgrade", _env=env)
+            # --- make sure hostpython has pip itself -------------------------
+            try:
+                shprint(hostpython, "-m", "pip", "--version", _env=env)
+            except sh.ErrorReturnCode:
+                # bootstrap pip into this interpreter if it’s missing
+                shprint(hostpython, "-m", "ensurepip", "--upgrade", _env=env)
 
-            # 2) upgrade pip/setuptools/wheel (needed for pyproject builds)
+            # --- core build tools (keep them ALL, as you asked) --------------
             shprint(
                 hostpython,
-                "-m", "pip",
+                "-m",
+                "pip",
                 "install",
                 "--upgrade",
                 "pip",
@@ -52,20 +71,25 @@ class LlamaCppPythonRecipe(Recipe):
                 _env=env,
             )
 
-            # 3) tools that llama-cpp-python’s build needs
+            # tools used by llama-cpp-python’s pyproject/scikit-build
             shprint(
                 hostpython,
-                "-m", "pip",
+                "-m",
+                "pip",
                 "install",
+                "--upgrade",
                 "cmake",
                 "ninja",
+                "scikit-build-core",
                 _env=env,
             )
 
-            # 4) finally build llama-cpp-python from source for this arch
+            # --- finally build llama-cpp-python itself -----------------------
+            # --no-binary :all: forces a full C/C++ build using our NDK + CMake.
             shprint(
                 hostpython,
-                "-m", "pip",
+                "-m",
+                "pip",
                 "install",
                 ".",
                 "--no-binary",

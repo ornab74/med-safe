@@ -8,9 +8,11 @@ class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
     version = "0.3.2"
 
-    # We deliberately don't use a tarball URL any more.
-    # pip will fetch llama-cpp-python from PyPI instead.
-    url = None
+    # Use the PyPI sdist, which *includes* the vendored llama.cpp
+    url = (
+        "https://files.pythonhosted.org/packages/source/l/llama_cpp_python/"
+        "llama_cpp_python-{version}.tar.gz"
+    )
 
     # p4a dependencies
     depends = ["python3"]
@@ -22,12 +24,22 @@ class LlamaCppPythonRecipe(Recipe):
     # we drive hostpython directly, not via targetpython
     call_hostpython_via_targetpython = False
 
-    # --------------------------------------------------
-    # Disable the default "download the URL" behaviour
-    # that is currently giving HTTP 404 errors.
-    # --------------------------------------------------
-    def download_if_necessary(self, arch):
-        info("[llama_cpp_python] skipping recipe URL download; using pip from PyPI instead.")
+    def get_recipe_env(self, arch):
+        """Start from p4a's default env and add CMake flags."""
+        env = super().get_recipe_env(arch)
+
+        cmake_args = env.get("CMAKE_ARGS", "")
+
+        # We only need the core library, no extra examples/servers/tests
+        cmake_args += " -DLLAMA_BUILD_EXAMPLES=OFF"
+        cmake_args += " -DLLAMA_BUILD_TESTS=OFF"
+        cmake_args += " -DLLAMA_BUILD_SERVER=OFF"
+
+        # Be conservative and disable GPU backends; mobile CPU only
+        cmake_args += " -DLLAMA_CUBLAS=OFF -DLLAMA_CUDA=OFF"
+
+        env["CMAKE_ARGS"] = cmake_args.strip()
+        return env
 
     def build_arch(self, arch):
         info(f"[llama_cpp_python] building for arch {arch}")
@@ -35,12 +47,13 @@ class LlamaCppPythonRecipe(Recipe):
         # p4a env for this recipe/arch (sets CC, CXX, CFLAGS, etc.)
         env = self.get_recipe_env(arch)
 
+        # directory where p4a unpacked the tarball
+        build_dir = self.get_build_dir(arch)
+
         # hostpython executable path from the toolchain context
         hostpython_cmd = sh.Command(self.ctx.hostpython)
 
-        # We don't need to cd into a build_dir now, because pip
-        # will fetch the source from PyPI rather than from a local tarball.
-        with current_directory("."):
+        with current_directory(build_dir):
             # --------------------------------------------------
             # 1) Make sure hostpython has pip
             # --------------------------------------------------
@@ -57,9 +70,12 @@ class LlamaCppPythonRecipe(Recipe):
                 )
 
             # --------------------------------------------------
-            # 2) Install / upgrade all build tools **inside hostpython**
+            # 2) Install / upgrade all build tools inside hostpython
             # --------------------------------------------------
-            info("[llama_cpp_python] installing build tools (pip, wheel, cmake, ninja, numpy...)")
+            info(
+                "[llama_cpp_python] installing build tools "
+                "(pip, wheel, cmake, ninja, meson, numpy...)"
+            )
             shprint(
                 hostpython_cmd,
                 "-m",
@@ -81,15 +97,14 @@ class LlamaCppPythonRecipe(Recipe):
 
             # --------------------------------------------------
             # 3) Build llama-cpp-python from source for this arch
-            #    directly from PyPI
             # --------------------------------------------------
-            info("[llama_cpp_python] installing llama-cpp-python from PyPI (source build)")
+            info("[llama_cpp_python] building and installing from source")
             shprint(
                 hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
-                f"llama-cpp-python=={self.version}",
+                ".",                    # current source tree
                 "--no-binary",
                 ":all:",                # force from-source build
                 "--no-build-isolation", # reuse the tools we just installed

@@ -5,58 +5,45 @@ import sh
 
 
 class LlamaCppPythonRecipe(Recipe):
+    # This name must match what you use in
+    # requirements = ... ,llama_cpp_python
     name = "llama_cpp_python"
+
+    # Pick a version that works for you
     version = "0.3.2"
     url = (
         "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
         "v{version}.tar.gz"
     )
 
-    # p4a dependencies
+    # p4a-level deps
     depends = ["python3"]
     python_depends = []
 
     # name inside site-packages
     site_packages_name = "llama_cpp_python"
 
-    # we drive hostpython directly, not via targetpython
+    # we call hostpython ourselves, not via targetpython
     call_hostpython_via_targetpython = False
 
     def build_arch(self, arch):
-        info(f"[llama_cpp_python] building for arch {arch}")
+        info(f"[llama_cpp_python] build_arch for {arch}")
 
-        # p4a env for this recipe/arch (sets CC, CXX, CFLAGS, etc.)
+        # Environment that p4a prepared for this arch (NDK, CFLAGS, etc.)
         env = self.get_recipe_env(arch)
 
-        # directory where p4a unpacked the tarball
+        # Use the host Python that p4a already uses to build extensions
+        hostpython = sh.Command(self.ctx.hostpython)
+
+        # Directory where llama-cpp-python sources are unpacked
         build_dir = self.get_build_dir(arch)
 
-        # hostpython executable path from the toolchain context
-        hostpython_cmd = sh.Command(self.ctx.hostpython)
-
         with current_directory(build_dir):
-            # --------------------------------------------------
-            # 1) Make sure hostpython has pip
-            # --------------------------------------------------
-            try:
-                shprint(hostpython_cmd, "-m", "pip", "--version", _env=env)
-            except sh.ErrorReturnCode:
-                # bootstrap pip into hostpython
-                info("[llama_cpp_python] bootstrapping pip via ensurepip")
-                shprint(
-                    hostpython_cmd,
-                    "-m",
-                    "ensurepip",
-                    "--upgrade",
-                    _env=env,
-                )
+            info("[llama_cpp_python] installing build tools into hostpython env")
 
-            # --------------------------------------------------
-            # 2) Install / upgrade all build tools **inside hostpython**
-            # --------------------------------------------------
-            info("[llama_cpp_python] installing build tools (pip, wheel, cmake, ninja...)")
+            # 1) Make sure pip + core build tooling is there
             shprint(
-                hostpython_cmd,
+                hostpython,
                 "-m",
                 "pip",
                 "install",
@@ -64,25 +51,29 @@ class LlamaCppPythonRecipe(Recipe):
                 "pip",
                 "setuptools",
                 "wheel",
-                "scikit-build-core",
                 "cmake",
                 "ninja",
+                # Build backends / helpers that show up in your logs
+                "scikit-build-core",
+                "flit_core",
                 _env=env,
             )
 
-            # --------------------------------------------------
-            # 3) Build llama-cpp-python from source for this arch
-            # --------------------------------------------------
             info("[llama_cpp_python] building and installing from source")
+
+            # 2) Build llama-cpp-python itself.
+            # --no-binary :all: forces a source build.
+            # --no-build-isolation makes pip use the env we just populated
+            # (so flit_core, scikit-build-core, etc. are available).
             shprint(
-                hostpython_cmd,
+                hostpython,
                 "-m",
                 "pip",
                 "install",
-                ".",                    # current source tree
+                ".",
                 "--no-binary",
-                ":all:",                # force from-source build
-                "--no-build-isolation", # reuse the tools we just installed
+                ":all:",
+                "--no-build-isolation",
                 _env=env,
             )
 

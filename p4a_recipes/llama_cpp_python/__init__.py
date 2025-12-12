@@ -8,12 +8,9 @@ class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
     version = "0.3.2"
 
-    # Use the PyPI sdist instead of the GitHub source tarball.
-    # The PyPI sdist *includes* vendor/llama.cpp and its CMakeLists.txt.
-    url = (
-        "https://files.pythonhosted.org/packages/source/l/"
-        "llama-cpp-python/llama-cpp-python-{version}.tar.gz"
-    )
+    # We deliberately don't use a tarball URL any more.
+    # pip will fetch llama-cpp-python from PyPI instead.
+    url = None
 
     # p4a dependencies
     depends = ["python3"]
@@ -25,38 +22,31 @@ class LlamaCppPythonRecipe(Recipe):
     # we drive hostpython directly, not via targetpython
     call_hostpython_via_targetpython = False
 
+    # --------------------------------------------------
+    # Disable the default "download the URL" behaviour
+    # that is currently giving HTTP 404 errors.
+    # --------------------------------------------------
+    def download_if_necessary(self, arch):
+        info("[llama_cpp_python] skipping recipe URL download; using pip from PyPI instead.")
+
     def build_arch(self, arch):
         info(f"[llama_cpp_python] building for arch {arch}")
 
         # p4a env for this recipe/arch (sets CC, CXX, CFLAGS, etc.)
         env = self.get_recipe_env(arch)
 
-        # Make CMake quieter and disable stuff we don't need on Android
-        cmake_args = [
-            "-DLLAMA_BUILD_EXAMPLES=OFF",
-            "-DLLAMA_BUILD_TESTS=OFF",
-            "-DLLAMA_BUILD_SERVER=OFF",
-            "-DLLAMA_CUBLAS=OFF",
-            "-DLLAMA_METAL=OFF",
-            "-DLLAMA_ACCELERATE=OFF",
-            "-DLLAMA_NATIVE=OFF",
-        ]
-        env["CMAKE_ARGS"] = " ".join(cmake_args)
-
-        # directory where p4a unpacked the tarball
-        build_dir = self.get_build_dir(arch)
-
         # hostpython executable path from the toolchain context
         hostpython_cmd = sh.Command(self.ctx.hostpython)
 
-        with current_directory(build_dir):
+        # We don't need to cd into a build_dir now, because pip
+        # will fetch the source from PyPI rather than from a local tarball.
+        with current_directory("."):
             # --------------------------------------------------
             # 1) Make sure hostpython has pip
             # --------------------------------------------------
             try:
                 shprint(hostpython_cmd, "-m", "pip", "--version", _env=env)
             except sh.ErrorReturnCode:
-                # bootstrap pip into hostpython
                 info("[llama_cpp_python] bootstrapping pip via ensurepip")
                 shprint(
                     hostpython_cmd,
@@ -69,42 +59,37 @@ class LlamaCppPythonRecipe(Recipe):
             # --------------------------------------------------
             # 2) Install / upgrade all build tools **inside hostpython**
             # --------------------------------------------------
-            build_deps = [
-                "pip",
-                "setuptools",
-                "wheel",
-                "cmake",
-                "ninja",
-                "scikit-build-core",
-                "meson-python",
-                "flit_core",
-                "typing_extensions",
-                "numpy==1.26.4",
-            ]
-            info(
-                "[llama_cpp_python] installing build tools: "
-                + ", ".join(build_deps)
-            )
+            info("[llama_cpp_python] installing build tools (pip, wheel, cmake, ninja, numpy...)")
             shprint(
                 hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
                 "--upgrade",
-                *build_deps,
+                "pip",
+                "setuptools",
+                "wheel",
+                "scikit-build-core",
+                "cmake",
+                "flit_core",
+                "meson-python",
+                "typing_extensions",
+                "numpy==1.26.4",
+                "ninja",
                 _env=env,
             )
 
             # --------------------------------------------------
             # 3) Build llama-cpp-python from source for this arch
+            #    directly from PyPI
             # --------------------------------------------------
-            info("[llama_cpp_python] building and installing from source")
+            info("[llama_cpp_python] installing llama-cpp-python from PyPI (source build)")
             shprint(
                 hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
-                ".",                    # current source tree
+                f"llama-cpp-python=={self.version}",
                 "--no-binary",
                 ":all:",                # force from-source build
                 "--no-build-isolation", # reuse the tools we just installed

@@ -7,9 +7,12 @@ import sh
 class LlamaCppPythonRecipe(Recipe):
     name = "llama_cpp_python"
     version = "0.3.2"
+
+    # Use the PyPI sdist instead of the GitHub source tarball.
+    # The PyPI sdist *includes* vendor/llama.cpp and its CMakeLists.txt.
     url = (
-        "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
-        "v{version}.tar.gz"
+        "https://files.pythonhosted.org/packages/source/l/"
+        "llama-cpp-python/llama-cpp-python-{version}.tar.gz"
     )
 
     # p4a dependencies
@@ -27,6 +30,18 @@ class LlamaCppPythonRecipe(Recipe):
 
         # p4a env for this recipe/arch (sets CC, CXX, CFLAGS, etc.)
         env = self.get_recipe_env(arch)
+
+        # Make CMake quieter and disable stuff we don't need on Android
+        cmake_args = [
+            "-DLLAMA_BUILD_EXAMPLES=OFF",
+            "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_SERVER=OFF",
+            "-DLLAMA_CUBLAS=OFF",
+            "-DLLAMA_METAL=OFF",
+            "-DLLAMA_ACCELERATE=OFF",
+            "-DLLAMA_NATIVE=OFF",
+        ]
+        env["CMAKE_ARGS"] = " ".join(cmake_args)
 
         # directory where p4a unpacked the tarball
         build_dir = self.get_build_dir(arch)
@@ -54,24 +69,29 @@ class LlamaCppPythonRecipe(Recipe):
             # --------------------------------------------------
             # 2) Install / upgrade all build tools **inside hostpython**
             # --------------------------------------------------
-            info("[llama_cpp_python] installing build tools (pip, wheel, cmake, ninja...)")
+            build_deps = [
+                "pip",
+                "setuptools",
+                "wheel",
+                "cmake",
+                "ninja",
+                "scikit-build-core",
+                "meson-python",
+                "flit_core",
+                "typing_extensions",
+                "numpy==1.26.4",
+            ]
+            info(
+                "[llama_cpp_python] installing build tools: "
+                + ", ".join(build_deps)
+            )
             shprint(
                 hostpython_cmd,
                 "-m",
                 "pip",
                 "install",
                 "--upgrade",
-                "pip",
-                "setuptools",
-                "wheel",
-                "scikit-build-core",
-                "cmake",
-                "flit_core",
-                "scikit-build-core",
-                "meson-python",
-                "typing_extensions",
-                "numpy==1.26.4",
-                "ninja",
+                *build_deps,
                 _env=env,
             )
 

@@ -1,74 +1,54 @@
-import os
+from pythonforandroid.recipe import Recipe
+from pythonforandroid.util import current_directory, shprint
+from pythonforandroid.logger import info
+import sh  # p4a uses 'sh' under the hood
 
-from pythonforandroid.recipe import PythonRecipe
-from pythonforandroid.toolchain import current_directory, shprint
-import sh
 
-
-class LlamaCppPythonRecipe(PythonRecipe):
+class LlamaCppPythonRecipe(Recipe):
     """
-    Custom recipe to build llama-cpp-python for Android.
+    Minimal pyproject-style recipe for llama-cpp-python.
 
-    NOTE:
-      - We subclass PythonRecipe (available in all recent p4a versions),
-        NOT CMakePythonRecipe (which your version doesn’t have).
-      - We override get_recipe_env to inject CMake / Android flags so the
-        package’s own CMakeLists can try to cross-compile for Android.
-      - This is a best-effort starting point; you may still need to tune
-        flags if CMake complains in later steps.
+    We let pip + the p4a toolchain do the heavy lifting:
+    - install cmake/ninja into the hostpython env
+    - pip install .  (which builds C++ with the NDK toolchain)
     """
 
     name = "llama_cpp_python"
-    version = "0.2.83"  # pick any version you like
-    url = "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/v{version}.tar.gz"
+    # pick a known-good version; adjust if you like
+    version = "0.3.2"
+    url = (
+        "https://github.com/abetlen/llama-cpp-python/archive/refs/tags/"
+        "v{version}.tar.gz"
+    )
 
-    # Keep it light: setuptools + wheel + numpy if needed
-    depends = ["setuptools", "wheel"]
+    # pure python deps handled by pip inside build_arch
+    depends = ["python3"]
+    python_depends = []
 
-    # Let targetpython run pip directly
+    site_packages_name = "llama_cpp_python"
     call_hostpython_via_targetpython = False
 
-    def get_recipe_env(self, arch):
-        # Start from the default env
-        env = super().get_recipe_env(arch)
-
-        # Paths / versions from the p4a context
-        ndk_dir = self.ctx.ndk_dir
-        api = self.ctx.ndk_api
-
-        # llama-cpp-python respects these environment variables
-        # when building with CMake
-        env["FORCE_CMAKE"] = "1"
-
-        # Generic CMake Android config
-        env["CMAKE_SYSTEM_NAME"] = "Android"
-        env["CMAKE_ANDROID_NDK"] = ndk_dir
-        env["CMAKE_SYSTEM_VERSION"] = str(api)
-        env["CMAKE_ANDROID_ARCH_ABI"] = arch.arch
-        env["CMAKE_ANDROID_STL_TYPE"] = "c++_static"
-
-        # Disable GPU / BLAS backends to simplify the build
-        env["LLAMA_CUBLAS"] = "0"
-        env["LLAMA_CLBLAST"] = "0"
-        env["LLAMA_METAL"] = "0"
-        env["LLAMA_OPENBLAS"] = "0"
-        env["LLAMA_BLAS"] = "0"
-
-        # This can help CMake find the toolchain
-        env["ANDROID_NDK"] = ndk_dir
-        env["ANDROIDAPI"] = str(api)
-
-        return env
-
     def build_arch(self, arch):
-        """
-        We just reuse PythonRecipe's build_arch, which uses pip to build
-        the extension, but with our tweaked env above.
-        """
-        # Optional: debug info
+        info(f"[llama_cpp_python] build_arch for {arch}")
+        env = self.get_recipe_env(arch)
+        hostpython = self.get_hostpython(arch)
         build_dir = self.get_build_dir(arch)
-        shprint(sh.echo, f"[llama_cpp_python] building in {build_dir} for {arch.arch}")
-        super().build_arch(arch)
+
+        with current_directory(build_dir):
+            # make sure build tools exist in the hostpython env
+            shprint(hostpython, "-m", "pip", "install", "cmake", "ninja", _env=env)
+
+            # build from source for this arch, no prebuilt wheels
+            shprint(
+                hostpython,
+                "-m",
+                "pip",
+                "install",
+                ".",
+                "--no-binary",
+                ":all:",
+                _env=env,
+            )
 
 
 recipe = LlamaCppPythonRecipe()

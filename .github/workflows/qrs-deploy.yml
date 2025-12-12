@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # Use the same paths Buildozer/p4a expect for the SDK
+      # SDK paths (what Buildozer/p4a expect)
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
-      # ❌ DO NOT set ANDROID_NDK_HOME here – let Buildozer handle NDK
+      # 🚫 Do NOT set ANDROID_NDK_HOME here – let Buildozer download NDK
+      # ANDROID_NDK_HOME: /usr/local/lib/android/ndk
 
     steps:
       - name: Checkout
@@ -65,6 +66,7 @@ jobs:
           mv tmp/cmdline-tools latest
           rmdir tmp
 
+          # legacy tools/bin layout for Buildozer/p4a
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" "$ANDROID_SDK_ROOT/tools/bin/avdmanager"
@@ -95,10 +97,11 @@ jobs:
           # p4a / pyjnius need Cython < 3
           pip install "Cython<3.0"
 
-          # Buildozer + recent python-for-android
-          pip install buildozer "python-for-android>=2024.6.1"
+          # Install a p4a version that actually exists, then a compatible Buildozer
+          pip install "python-for-android==2024.1.21"
+          pip install "buildozer<1.5.0"
 
-          # runtime deps (no llama-cpp-python here!)
+          # runtime deps (llama-cpp-python will be handled by custom p4a recipe)
           pip install \
             kivy==2.2.1 \
             kivymd \
@@ -112,7 +115,7 @@ jobs:
         run: |
           echo "ANDROIDSDK=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          # ❌ no ANDROIDNDK / ANDROID_NDK_HOME export
+          # no ANDROIDNDK / ANDROID_NDK_HOME here
 
       # ---- Build debug APK ----
       - name: Build debug APK

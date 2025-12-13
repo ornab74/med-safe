@@ -137,6 +137,4 @@ If we change how QRS Android handles data (for example, adding cloud sync, analy
 
 For privacy questions, contact: **[janulisgraylan@gmail.com](mailto:janulisgraylan@gmail.com)** (Graylan Janulis)
 
----
 
-If you want, paste your **final Play Console “Data safety” answers** (especially whether you “collect” or only “process” data locally, and whether any prompts ever go to a server), and I’ll rewrite this to match those exact checkboxes so it won’t get flagged in review.

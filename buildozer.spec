@@ -61,8 +61,8 @@ android.sdk_path = /usr/local/lib/android/sdk
 # (int) Android API to build against
 android.api = 34
 
-# (int) Minimum supported Android API
-android.minapi = 21
+android.minapi = 23
+android.ndk_api = 23
 
 # (str) Build-tools version
 android.build_tools_version = 34.0.0

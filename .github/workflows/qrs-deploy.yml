@@ -1,5 +1,4 @@
-
-name: Build Android APK
+name: Build Android (Debug / Release)
 
 on:
   push:
@@ -14,7 +13,6 @@ jobs:
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_NDK_HOME: /usr/local/lib/android/ndk
 
     steps:
       - name: Checkout
@@ -44,47 +42,29 @@ jobs:
 
       - name: Install Android SDK (cmdline-tools)
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
-
-          curl -fsSL -o cmdline-tools.zip \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-
-          mkdir -p tmp
-          unzip -q cmdline-tools.zip -d tmp
-          rm cmdline-tools.zip
-
-          rm -rf latest
-          mv tmp/cmdline-tools latest
-          rmdir tmp
-
+          curl -fsSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q tools.zip
+          rm tools.zip
+          mv cmdline-tools latest
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
-          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" "$ANDROID_SDK_ROOT/tools/bin/avdmanager"
-
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
 
       - name: Install Android platforms / build-tools
         run: |
-          set -euo pipefail
-          which sdkmanager || echo "sdkmanager not in PATH!"
           sdkmanager --version || true
-
-          # Avoid "Broken pipe" causing failure with pipefail
-          set +o pipefail
-          yes | sdkmanager --licenses >/dev/null
-          yes | sdkmanager \
+          yes | sdkmanager --licenses || true
+          sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
-          set -o pipefail
 
       - name: Install Buildozer & Python dependencies
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
@@ -97,17 +77,14 @@ jobs:
             psutil \
             pennylane
 
-      # Restore keystore ONLY when not a PR
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
         run: |
-          set -euo pipefail
           umask 077
           echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > qrs-upload.jks
           chmod 600 qrs-upload.jks
 
-      # Release build (signed) on main/manual, Debug build on PR
-      - name: Build signed RELEASE APK
+      - name: Build signed RELEASE (AAB)
         if: github.event_name != 'pull_request'
         env:
           P4A_RELEASE_KEYSTORE: ${{ github.workspace }}/qrs-upload.jks
@@ -115,20 +92,23 @@ jobs:
           P4A_RELEASE_KEYALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          set -euo pipefail
           buildozer -v android release
-          ls -lah bin || true
 
-      - name: Build debug APK (PR safe)
+      - name: Build debug APK
         if: github.event_name == 'pull_request'
         run: |
-          set -euo pipefail
           buildozer android debug
-          ls -lah bin || true
 
-      - name: Upload APK artifact
+      - name: Collect build outputs
+        run: |
+          mkdir -p artifacts
+          find . -name "*.apk" -exec cp {} artifacts/ \; || true
+          find . -name "*.aab" -exec cp {} artifacts/ \; || true
+          ls -lah artifacts
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: QRS-Android-APK
-          path: bin/*.apk
+          name: QRS-Android-Build
+          path: artifacts/*
           if-no-files-found: error

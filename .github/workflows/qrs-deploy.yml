@@ -1,3 +1,4 @@
+
 name: Build Android (Debug / Release)
 
 on:
@@ -15,17 +16,14 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -35,14 +33,12 @@ jobs:
           sudo apt-get install -y \
             build-essential git zip unzip curl \
             libssl-dev libffi-dev libsqlite3-dev \
-            libbz2-dev zlib1g-dev \
-            libncurses5-dev libgdbm-dev libnss3-dev \
-            libreadline-dev liblzma-dev \
-            libjpeg-dev libfreetype6-dev
+            libbz2-dev zlib1g-dev libncurses5-dev \
+            libgdbm-dev libnss3-dev libreadline-dev \
+            liblzma-dev libjpeg-dev libfreetype6-dev
 
-      - name: Install Android SDK (cmdline-tools)
+      - name: Install Android SDK
         run: |
-          set -e
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
           curl -fsSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
@@ -54,7 +50,7 @@ jobs:
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
 
-      - name: Install Android platforms / build-tools
+      - name: Install Android packages
         run: |
           sdkmanager --version || true
           yes | sdkmanager --licenses || true
@@ -63,19 +59,12 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Install Buildozer & Python dependencies
+      - name: Install Buildozer & Python deps
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
-          pip install \
-            kivy==2.2.1 \
-            kivymd \
-            httpx \
-            cryptography \
-            aiosqlite \
-            psutil \
-            pennylane
+          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
@@ -93,22 +82,18 @@ jobs:
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           buildozer -v android release
+          ls -lah bin
 
       - name: Build debug APK
         if: github.event_name == 'pull_request'
         run: |
           buildozer android debug
+          ls -lah bin
 
-      - name: Collect build outputs
-        run: |
-          mkdir -p artifacts
-          find . -name "*.apk" -exec cp {} artifacts/ \; || true
-          find . -name "*.aab" -exec cp {} artifacts/ \; || true
-          ls -lah artifacts
-
-      - name: Upload build artifacts
+      - name: Upload RELEASE AAB
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: QRS-Android-Build
-          path: artifacts/*
+          name: QRS-Android-AAB
+          path: bin/*.aab
           if-no-files-found: error

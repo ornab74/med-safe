@@ -10,7 +10,8 @@ source.dir = .
 source.main = main.py
 
 version = 0.1.0
-android.version_code = 1023101
+
+android.version_code = 1024000
 
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 

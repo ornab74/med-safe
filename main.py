@@ -1,8 +1,10 @@
-# main.py
-import os, sys, time, json, shutil, hashlib, asyncio, threading, httpx, aiosqlite, getpass, math, random, re
+
+import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Callable, Dict
+from contextlib import contextmanager
+from threading import RLock
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -19,6 +21,24 @@ except Exception:
     qml = None
     pnp = None
 
+from kivy.lang import Builder
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.uix.widget import Widget
+from kivy.animation import Animation
+from kivy.metrics import dp
+from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
+from kivy.properties import NumericProperty, StringProperty, ListProperty
+from kivymd.app import MDApp
+from kivymd.uix.dialog import MDDialog
+from kivymd.uix.button import MDFlatButton
+from kivymd.uix.list import TwoLineListItem
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.boxlayout import MDBoxLayout
+
+if hasattr(Window, "size"):
+    Window.size = (420, 760)
+
 MODEL_REPO = "https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/"
 MODEL_FILE = "llama3-small-Q3_K_M.gguf"
 MODELS_DIR = Path("models")
@@ -29,75 +49,18 @@ KEY_PATH = Path(".enc_key")
 EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-CSI = "\x1b["
-def clear_screen(): sys.stdout.write(CSI + "2J" + CSI + "H")
-def show_cursor(): sys.stdout.write(CSI + "?25h")
-def color(text, fg=None, bold=False):
-    codes=[]
-    if fg: codes.append(str(fg))
-    if bold: codes.append('1')
-    if not codes: return text
-    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
-def boxed(title: str, lines: List[str], width: int = 72):
-    top = "┌" + "─"*(width-2) + "┐"
-    bot = "└" + "─"*(width-2) + "┘"
-    title_line = f"│ {color(title, fg=36, bold=True):{width-4}} │"
-    body=[]
-    for l in lines:
-        if len(l) > width-4:
-            chunks = [l[i:i+width-4] for i in range(0,len(l),width-4)]
-        else:
-            chunks=[l]
-        for c in chunks:
-            body.append(f"│ {c:{width-4}} │")
-    return "\n".join([top, title_line] + body + [bot])
+_CRYPTO_LOCK = RLock()
+_MODEL_LOCK = RLock()
+_MODEL_USERS = 0
 
-def getch():
-    try:
-        import tty, termios
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = os.read(fd, 3)
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    except (ImportError, AttributeError, OSError):
-        s = input()
-        return s[0].encode() if s else b''
+def _atomic_write_bytes(path: Path, data: bytes):
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+    tmp.write_bytes(data)
+    tmp.replace(path)
 
-def read_menu_choice(num_items:int, prompt="Use ↑↓ arrows or number, Enter to select: ")->int:
-    print(prompt)
-    try:
-        idx = 0
-        while True:
-            ch = getch()
-            if not ch: continue
-            if ch == b'\x1b[A' or ch == b'\x1b\x00A':
-                idx = (idx - 1) % num_items
-            elif ch == b'\x1b[B' or ch == b'\x1b\x00B':
-                idx = (idx + 1) % num_items
-            elif ch in (b'\r', b'\n', b'\x0d'):
-                return idx
-            else:
-                try:
-                    s = ch.decode(errors='ignore')
-                    if s.strip().isdigit():
-                        n = int(s.strip())
-                        if 1 <= n <= num_items:
-                            return n-1
-                except Exception:
-                    pass
-            sys.stdout.write(f"\rSelected: {idx+1}/{num_items} ")
-            sys.stdout.flush()
-    except Exception:
-        while True:
-            s = input("Enter number: ").strip()
-            if s.isdigit():
-                n = int(s)
-                if 1 <= n <= num_items:
-                    return n-1
+def _tmp_path(prefix: str, suffix: str) -> Path:
+    base = Path(tempfile.gettempdir()) if tempfile.gettempdir() else Path(".")
+    return base / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
 
 def aes_encrypt(data: bytes, key: bytes) -> bytes:
     aes = AESGCM(key)
@@ -117,141 +80,136 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 def get_or_create_key() -> bytes:
-    if KEY_PATH.exists():
-        d = KEY_PATH.read_bytes()
-        if len(d) >= 48: return d[16:48]
-        return d[:32]
-    key = AESGCM.generate_key(256)
-    KEY_PATH.write_bytes(key)
-    print(f"🔑 New random key generated and saved to {KEY_PATH}")
-    return key
+    with _CRYPTO_LOCK:
+        if KEY_PATH.exists():
+            d = KEY_PATH.read_bytes()
+            if len(d) >= 48:
+                return d[16:48]
+            return d[:32]
+        key = AESGCM.generate_key(256)
+        _atomic_write_bytes(KEY_PATH, key)
+        return key
 
-def derive_key_from_passphrase(pw:str, salt:Optional[bytes]=None) -> Tuple[bytes, bytes]:
-    if salt is None: salt = os.urandom(16)
+def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
+    if salt is None:
+        salt = os.urandom(16)
     kdf_der = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000)
     derived = kdf_der.derive(pw.encode("utf-8"))
     return salt, derived
 
-def ensure_key_interactive() -> bytes:
-    if KEY_PATH.exists():
-        data = KEY_PATH.read_bytes()
-        if len(data) >= 48: return data[16:48]
-        if len(data) >= 32: return data[:32]
-    print("Key not found. Create new key:")
-    print("  1) Generate random key (saved raw)")
-    print("  2) Derive from passphrase (salt+derived saved)")
-    opt = input("Choose (1/2): ").strip()
-    if opt == "2":
-        pw = getpass.getpass("Enter passphrase: ")
-        pw2 = getpass.getpass("Confirm: ")
-        if pw != pw2:
-            print("Passphrases mismatch. Aborting.")
-            sys.exit(1)
-        salt, key = derive_key_from_passphrase(pw)
-        KEY_PATH.write_bytes(salt + key)
-        print(f"Saved salt+derived key to {KEY_PATH}")
-        return key
-    else:
-        key = AESGCM.generate_key(256)
-        KEY_PATH.write_bytes(key)
-        print(f"Saved random key to {KEY_PATH}")
-        return key
-
-def download_model_httpx(url: str, dest: Path, show_progress=True, timeout=None, expected_sha: Optional[str]=None):
-    print(f"⬇️  Downloading model from {url}\nTo: {dest}")
+def download_model_httpx_with_cb(url: str, dest: Path, progress_cb: Optional[Callable[[int, int], None]] = None, timeout=None) -> str:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
     with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as r:
         r.raise_for_status()
         total = int(r.headers.get("Content-Length") or 0)
         done = 0
-        h = hashlib.sha256()
-        with dest.open("wb") as f:
-            for chunk in r.iter_bytes(chunk_size=8192):
-                if not chunk: break
-                f.write(chunk)
-                h.update(chunk)
-                done += len(chunk)
-                if total and show_progress:
-                    pct = done / total * 100
-                    bar = int(pct // 2)
-                    sys.stdout.write(f"\r[{('#'*bar).ljust(50)}] {pct:5.1f}% ({done//1024}KB/{total//1024}KB)")
-                    sys.stdout.flush()
-    if show_progress: print("\n✅ Download complete.")
-    sha = h.hexdigest()
-    print(f"SHA256: {sha}")
-    if expected_sha:
-        if sha.lower() == expected_sha.lower():
-            print(color("SHA256 matches expected.", fg=32, bold=True))
-        else:
-            print(color(f"SHA256 MISMATCH! expected {expected_sha} got {sha}", fg=31, bold=True))
-    return sha
+        tmp = dest.with_suffix(dest.suffix + f".dl.{uuid.uuid4().hex}")
+        try:
+            with tmp.open("wb") as f:
+                for chunk in r.iter_bytes(chunk_size=1024 * 256):
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    if progress_cb:
+                        progress_cb(done, total)
+            tmp.replace(dest)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return h.hexdigest()
 
 def encrypt_file(src: Path, dest: Path, key: bytes):
-    print(f"🔐 Encrypting {src} -> {dest}")
-    data = src.read_bytes()
-    start = time.time()
-    enc = aes_encrypt(data, key)
-    dest.write_bytes(enc)
-    dur = time.time()-start
-    print(f"✅ Encrypted ({len(enc)} bytes) in {dur:.2f}s")
+    with _CRYPTO_LOCK:
+        data = src.read_bytes()
+        enc = aes_encrypt(data, key)
+        _atomic_write_bytes(dest, enc)
 
 def decrypt_file(src: Path, dest: Path, key: bytes):
-    print(f"🔓 Decrypting {src} -> {dest}")
-    enc = src.read_bytes()
-    data = aes_decrypt(enc, key)
-    dest.write_bytes(data)
-    print(f"✅ Decrypted ({len(data)} bytes)")
+    with _CRYPTO_LOCK:
+        enc = src.read_bytes()
+        data = aes_decrypt(enc, key)
+        tmp = dest.with_suffix(dest.suffix + f".dec.{uuid.uuid4().hex}")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
 
 async def init_db(key: bytes):
-    if not DB_PATH.exists():
-        async with aiosqlite.connect("temp.db") as db:
-            await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)")
-            await db.commit()
-        with open("temp.db","rb") as f:
-            enc = aes_encrypt(f.read(), key)
-        DB_PATH.write_bytes(enc)
-        os.remove("temp.db")
+    with _CRYPTO_LOCK:
+        if DB_PATH.exists():
+            return
+        tmp_plain = _tmp_path("chat_init", ".db")
+        try:
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)")
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 async def log_interaction(prompt: str, response: str, key: bytes):
-    dec = Path("temp.db")
-    decrypt_file(DB_PATH, dec, key)
-    async with aiosqlite.connect(dec) as db:
-        await db.execute("INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)", (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response))
-        await db.commit()
-    with dec.open("rb") as f:
-        enc = aes_encrypt(f.read(), key)
-    DB_PATH.write_bytes(enc)
-    dec.unlink()
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("chat_work", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                await db.execute(
+                    "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
+                    (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
+                )
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-async def fetch_history(key: bytes, limit:int=20, offset:int=0, search:Optional[str]=None):
-    dec = Path("temp.db")
-    decrypt_file(DB_PATH, dec, key)
-    rows=[]
-    async with aiosqlite.connect(dec) as db:
-        if search:
-            q = f"%{search}%"
-            async with db.execute("SELECT id,timestamp,prompt,response FROM history WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?", (q,q,limit,offset)) as cur:
-                async for r in cur: rows.append(r)
-        else:
-            async with db.execute("SELECT id,timestamp,prompt,response FROM history ORDER BY id DESC LIMIT ? OFFSET ?", (limit,offset)) as cur:
-                async for r in cur: rows.append(r)
-    with dec.open("rb") as f:
-        DB_PATH.write_bytes(aes_encrypt(f.read(), key))
-    dec.unlink()
-    return rows
+async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Optional[str] = None):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("chat_read", ".db")
+        rows = []
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                if search:
+                    q = f"%{search}%"
+                    async with db.execute(
+                        "SELECT id,timestamp,prompt,response FROM history WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (q, q, limit, offset),
+                    ) as cur:
+                        async for r in cur:
+                            rows.append(r)
+                else:
+                    async with db.execute(
+                        "SELECT id,timestamp,prompt,response FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
+                        (limit, offset),
+                    ) as cur:
+                        async for r in cur:
+                            rows.append(r)
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return rows
 
 def load_llama_model_blocking(model_path: Path) -> Llama:
-    return Llama(model_path=str(model_path), n_ctx=2048, n_threads=4)
-
-import os
-import sys
-import time
-from typing import Dict
-
-try:
-    import psutil
-except Exception:
-    psutil = None
+    return Llama(model_path=str(model_path), n_ctx=2048, n_threads=max(2, (os.cpu_count() or 4) // 2))
 
 def _read_proc_stat():
     try:
@@ -342,18 +300,12 @@ def _read_temperature():
                     if not raw:
                         continue
                     val = int(raw)
-                    if val > 1000:
-                        c = val / 1000.0
-                    else:
-                        c = float(val)
+                    c = val / 1000.0 if val > 1000 else float(val)
                     temps.append(c)
                 except Exception:
                     continue
         if not temps:
-            possible = [
-                "/sys/devices/virtual/thermal/thermal_zone0/temp",
-                "/sys/class/hwmon/hwmon0/temp1_input",
-            ]
+            possible = ["/sys/devices/virtual/thermal/thermal_zone0/temp", "/sys/class/hwmon/hwmon0/temp1_input"]
             for p in possible:
                 try:
                     with open(p, "r") as f:
@@ -412,9 +364,7 @@ def collect_system_metrics() -> Dict[str, float]:
         temp = _read_temperature()
     core_ok = all(x is not None for x in (cpu, mem, load1, proc))
     if not core_ok:
-        missing = [name for name, val in (("cpu", cpu), ("mem", mem), ("load1", load1), ("proc", proc)) if val is None]
-        print(f"[FATAL] Unable to obtain core system metrics: missing {missing}")
-        sys.exit(2)
+        raise RuntimeError("Unable to obtain core system metrics")
     cpu = float(max(0.0, min(1.0, cpu)))
     mem = float(max(0.0, min(1.0, mem)))
     load1 = float(max(0.0, min(1.0, load1)))
@@ -422,74 +372,84 @@ def collect_system_metrics() -> Dict[str, float]:
     temp = float(max(0.0, min(1.0, temp))) if temp is not None else 0.0
     return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
 
-def metrics_to_rgb(metrics: dict) -> Tuple[float,float,float]:
-    cpu = metrics.get("cpu",0.1); mem = metrics.get("mem",0.1); temp = metrics.get("temp",0.1); load1 = metrics.get("load1",0.0); proc = metrics.get("proc",0.0)
-    r = cpu * (1.0 + load1); g = mem * (1.0 + proc); b = temp * (0.5 + cpu * 0.5)
-    maxi = max(r,g,b,1.0); r,g,b = r/maxi,g/maxi,b/maxi
-    return (float(max(0.0,min(1.0,r))), float(max(0.0,min(1.0,g))), float(max(0.0,min(1.0,b))))
+def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
+    cpu = metrics.get("cpu", 0.1)
+    mem = metrics.get("mem", 0.1)
+    temp = metrics.get("temp", 0.1)
+    load1 = metrics.get("load1", 0.0)
+    proc = metrics.get("proc", 0.0)
+    r = cpu * (1.0 + load1)
+    g = mem * (1.0 + proc)
+    b = temp * (0.5 + cpu * 0.5)
+    maxi = max(r, g, b, 1.0)
+    r, g, b = r / maxi, g / maxi, b / maxi
+    return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
 
-def pennylane_entropic_score(rgb: Tuple[float,float,float], shots: int = 256) -> float:
+def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
     if qml is None or pnp is None:
-        r,g,b = rgb
-        seed = int((r*255)<<16 | (g*255)<<8 | (b*255))
+        r, g, b = rgb
+        seed = int((int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255))
         random.seed(seed)
-        base = (0.3*r + 0.4*g + 0.3*b)
-        noise = (random.random()-0.5)*0.08
+        base = (0.3 * r + 0.4 * g + 0.3 * b)
+        noise = (random.random() - 0.5) * 0.08
         return max(0.0, min(1.0, base + noise))
     dev = qml.device("default.qubit", wires=2, shots=shots)
     @qml.qnode(dev)
-    def circuit(a,b,c):
+    def circuit(a, b, c):
         qml.RX(a * math.pi, wires=0)
         qml.RY(b * math.pi, wires=1)
-        qml.CNOT(wires=[0,1])
+        qml.CNOT(wires=[0, 1])
         qml.RZ(c * math.pi, wires=1)
         qml.RX((a + b) * math.pi / 2, wires=0)
         qml.RY((b + c) * math.pi / 2, wires=1)
         return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))
-    a,b,c = float(rgb[0]), float(rgb[1]), float(rgb[2])
+    a, b, c = float(rgb[0]), float(rgb[1]), float(rgb[2])
     try:
-        ev0,ev1 = circuit(a,b,c)
-        combined = ((ev0+1.0)/2.0 * 0.6 + (ev1+1.0)/2.0 * 0.4)
-        score = 1.0 / (1.0 + math.exp(-6.0*(combined - 0.5)))
-        return float(max(0.0,min(1.0,score)))
+        ev0, ev1 = circuit(a, b, c)
+        combined = ((ev0 + 1.0) / 2.0 * 0.6 + (ev1 + 1.0) / 2.0 * 0.4)
+        score = 1.0 / (1.0 + math.exp(-6.0 * (combined - 0.5)))
+        return float(max(0.0, min(1.0, score)))
     except Exception:
-        return float(0.5 * (a+b+c) / 3.0)
-
-def entropic_to_modifier(score: float) -> float:
-    return (score - 0.5) * 0.4
+        return float(0.5 * (a + b + c) / 3.0)
 
 def entropic_summary_text(score: float) -> str:
-    if score >= 0.75: level = "high"
-    elif score >= 0.45: level = "medium"
-    else: level = "low"
+    if score >= 0.75:
+        level = "high"
+    elif score >= 0.45:
+        level = "medium"
+    else:
+        level = "low"
     return f"entropic_score={score:.3f} (level={level})"
 
 def _simple_tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
 
-def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str,float]:
+def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
     toks = _simple_tokenize(prompt_text)
-    freq={}
-    for t in toks: freq[t]=freq.get(t,0)+1
-    hazard_boost = {"ice":2.0,"wet":1.8,"snow":2.0,"flood":2.0,"construction":1.8,"pedestrian":1.8,"debris":1.8,"animal":1.5,"stall":1.4,"fog":1.6}
-    scored={}
-    for t,c in freq.items():
-        boost = hazard_boost.get(t,1.0)
-        scored[t]=c*boost
-    items = sorted(scored.items(), key=lambda x:-x[1])[:top_n]
-    if not items: return {}
+    freq = {}
+    for t in toks:
+        freq[t] = freq.get(t, 0) + 1
+    hazard_boost = {"ice": 2.0, "wet": 1.8, "snow": 2.0, "flood": 2.0, "construction": 1.8, "pedestrian": 1.8, "debris": 1.8, "animal": 1.5, "stall": 1.4, "fog": 1.6}
+    scored = {}
+    for t, c in freq.items():
+        boost = hazard_boost.get(t, 1.0)
+        scored[t] = c * boost
+    items = sorted(scored.items(), key=lambda x: -x[1])[:top_n]
+    if not items:
+        return {}
     maxv = items[0][1]
-    return {k: float(v/maxv) for k,v in items}
+    return {k: float(v / maxv) for k, v in items}
 
-def punkd_apply(prompt_text: str, token_weights: Dict[str,float], profile: str = "balanced") -> Tuple[str,float]:
-    if not token_weights: return prompt_text, 1.0
-    mean_weight = sum(token_weights.values())/len(token_weights)
+def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str = "balanced") -> Tuple[str, float]:
+    if not token_weights:
+        return prompt_text, 1.0
+    mean_weight = sum(token_weights.values()) / len(token_weights)
     profile_map = {"conservative": 0.6, "balanced": 1.0, "aggressive": 1.4}
     base = profile_map.get(profile, 1.0)
-    multiplier = 1.0 + (mean_weight - 0.5) * 0.8 * (base if base>1.0 else 1.0)
+    multiplier = 1.0 + (mean_weight - 0.5) * 0.8 * (base if base > 1.0 else 1.0)
     multiplier = max(0.6, min(1.8, multiplier))
-    sorted_tokens = sorted(token_weights.items(), key=lambda x:-x[1])[:6]
-    markers = " ".join([f"<ATTN:{t}:{round(w,2)}>" for t,w in sorted_tokens])
+    sorted_tokens = sorted(token_weights.items(), key=lambda x: -x[1])[:6]
+    markers = " ".join([f"<ATTN:{t}:{round(w,2)}>" for t, w in sorted_tokens])
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
     return patched, multiplier
 
@@ -497,22 +457,26 @@ def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk
     assembled = ""
     cur_prompt = prompt
     token_weights = punkd_analyze(prompt, top_n=16)
-    iterations = max(1, (max_total_tokens + chunk_tokens - 1)//chunk_tokens)
+    iterations = max(1, (max_total_tokens + chunk_tokens - 1) // chunk_tokens)
     prev_tail = ""
-    for i in range(iterations):
+    for _ in range(iterations):
         patched_prompt, mult = punkd_apply(cur_prompt, token_weights, profile=punkd_profile)
         temp = max(0.01, min(2.0, base_temperature * mult))
         out = llm(patched_prompt, max_tokens=chunk_tokens, temperature=temp)
         text = ""
         if isinstance(out, dict):
-            try: text = out.get("choices",[{"text":""}])[0].get("text","")
+            try:
+                text = out.get("choices", [{"text": ""}])[0].get("text", "")
             except Exception:
-                text = out.get("text","") if isinstance(out, dict) else ""
+                text = out.get("text", "") if isinstance(out, dict) else ""
         else:
-            try: text = str(out)
-            except Exception: text = ""
+            try:
+                text = str(out)
+            except Exception:
+                text = ""
         text = (text or "").strip()
-        if not text: break
+        if not text:
+            break
         overlap = 0
         max_ol = min(30, len(prev_tail), len(text))
         for olen in range(max_ol, 0, -1):
@@ -521,10 +485,13 @@ def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk
                 break
         append_text = text[overlap:] if overlap else text
         assembled += append_text
-        prev_tail = assembled[-120:] if len(assembled)>120 else assembled
-        if streaming_callback: streaming_callback(append_text)
-        if assembled.strip().endswith(("Low","Medium","High")): break
-        if len(text.split()) < max(4, chunk_tokens//8): break
+        prev_tail = assembled[-120:] if len(assembled) > 120 else assembled
+        if streaming_callback:
+            streaming_callback(append_text)
+        if assembled.strip().endswith(("Low", "Medium", "High")):
+            break
+        if len(text.split()) < max(4, chunk_tokens // 8):
+            break
         cur_prompt = prompt + "\n\nAssistant so far:\n" + assembled + "\n\nContinue:"
     return assembled.strip()
 
@@ -535,320 +502,50 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
         rgb = metrics_to_rgb(metrics)
         score = pennylane_entropic_score(rgb)
         entropy_text = entropic_summary_text(score)
-        metrics_line = "sys_metrics: cpu={cpu:.2f},mem={mem:.2f},load={load1:.2f},temp={temp:.2f},proc={proc:.2f}".format(cpu=metrics.get("cpu",0.0), mem=metrics.get("mem",0.0), load1=metrics.get("load1",0.0), temp=metrics.get("temp",0.0), proc=metrics.get("proc_count",0.0))
+        metrics_line = "sys_metrics: cpu={cpu:.2f},mem={mem:.2f},load={load1:.2f},temp={temp:.2f},proc={proc:.2f}".format(
+            cpu=metrics.get("cpu", 0.0),
+            mem=metrics.get("mem", 0.0),
+            load1=metrics.get("load1", 0.0),
+            temp=metrics.get("temp", 0.0),
+            proc=metrics.get("proc", 0.0),
+        )
     else:
         metrics_line = "sys_metrics: disabled"
-    tpl = (
-f"You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
-f"Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
-f"Your reply must be only one word: Low, Medium, or High.\n\n"
-f"[tuning]\n"
-f"Scene details:\n"
-f"Location: {data.get('location','unspecified location')}\n"
-f"Road type: {data.get('road_type','unknown')}\n"
-f"Weather: {data.get('weather','unknown')}\n"
-f"Traffic: {data.get('traffic','unknown')}\n"
-f"Obstacles: {data.get('obstacles','none')}\n"
-f"Sensor notes: {data.get('sensor_notes','none')}\n"
-f"{metrics_line}\n"
-f"Quantum State: {entropy_text}\n"
-f"[/tuning]\n\n"
-f"Follow these strict rules when forming your decision:\n"
-f"- Think through all scene factors internally but do not show reasoning.\n"
-f"- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
-f"- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
-f"- Choose only one risk level that best fits the entire situation.\n"
-f"- Output exactly one word, with no punctuation or labels.\n"
-f"- The valid outputs are only: Low, Medium, High.\n\n"
-f"[action]\n"
-f"1) Normalize sensor inputs to comparable scales.\n"
-f"3) Map environmental risk cues -> discrete label using conservative thresholds.\n"
-f"4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
-f"5) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
-f"6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
-f"[/action]\n\n"
-f"[replytemplate]\nLow | Medium | High\n[/replytemplate]"
+    return (
+        "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
+        "Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
+        "Your reply must be only one word: Low, Medium, or High.\n\n"
+        "[tuning]\n"
+        "Scene details:\n"
+        f"Location: {data.get('location','unspecified location')}\n"
+        f"Road type: {data.get('road_type','unknown')}\n"
+        f"Weather: {data.get('weather','unknown')}\n"
+        f"Traffic: {data.get('traffic','unknown')}\n"
+        f"Obstacles: {data.get('obstacles','none')}\n"
+        f"Sensor notes: {data.get('sensor_notes','none')}\n"
+        f"{metrics_line}\n"
+        f"Quantum State: {entropy_text}\n"
+        "[/tuning]\n\n"
+        "Follow these strict rules when forming your decision:\n"
+        "- Think through all scene factors internally but do not show reasoning.\n"
+        "- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
+        "- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
+        "- Choose only one risk level that best fits the entire situation.\n"
+        "- Output exactly one word, with no punctuation or labels.\n"
+        "- The valid outputs are only: Low, Medium, High.\n\n"
+        "[action]\n"
+        "1) Normalize sensor inputs to comparable scales.\n"
+        "3) Map environmental risk cues -> discrete label using conservative thresholds.\n"
+        "4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
+        "5) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
+        "6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
+        "[/action]\n\n"
+        "[replytemplate]\n"
+        "Low | Medium | High\n"
+        "[/replytemplate]"
     )
-    return tpl
-
-def header(status:dict):
-    s = f" Secure LLM CLI — Model: {'loaded' if status.get('model_loaded') else 'none'} | Key: {'present' if status.get('key') else 'missing'} "
-    print(color(s.center(80,'─'), fg=35, bold=True))
-
-def model_manager(state:dict):
-    while True:
-        clear_screen(); header(state)
-        lines=["1) Download model from remote repo (httpx)","2) Verify plaintext model hash (compute SHA256)","3) Encrypt plaintext model -> .aes","4) Decrypt .aes -> plaintext (temporary)","5) Delete plaintext model","6) Back"]
-        print(boxed("Model Manager", lines))
-        choice = input("Choose (1-6): ").strip()
-        if choice=="1":
-            if MODEL_PATH.exists():
-                if input("Plaintext model exists; overwrite? (y/N): ").strip().lower()!='y': continue
-            try:
-                url = MODEL_REPO + MODEL_FILE
-                sha = download_model_httpx(url, MODEL_PATH, show_progress=True, timeout=None, expected_sha=EXPECTED_HASH)
-                print(f"Downloaded to {MODEL_PATH}")
-                print(f"Computed SHA256: {sha}")
-                if input("Encrypt downloaded model with current key now? (Y/n): ").strip().lower()!='n':
-                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key'])
-                    print(f"Encrypted -> {ENCRYPTED_MODEL}")
-                    if input("Remove plaintext model? (Y/n): ").strip().lower()!='n':
-                        MODEL_PATH.unlink(); print("Plaintext removed.")
-            except Exception as e:
-                print(f"Download failed: {e}")
-            input("Enter to continue...")
-        elif choice=="2":
-            if not MODEL_PATH.exists(): print("No plaintext model found.")
-            else: print(f"SHA256: {sha256_file(MODEL_PATH)}")
-            input("Enter to continue...")
-        elif choice=="3":
-            if not MODEL_PATH.exists(): print("No plaintext model to encrypt."); input("Enter..."); continue
-            encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key'])
-            if input("Remove plaintext? (Y/n): ").strip().lower()!='n':
-                MODEL_PATH.unlink(); print("Removed plaintext.")
-            input("Enter...")
-        elif choice=="4":
-            if not ENCRYPTED_MODEL.exists(): print("No .aes model present.")
-            else: decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state['key'])
-            input("Enter...")
-        elif choice=="5":
-            if MODEL_PATH.exists():
-                if input(f"Delete {MODEL_PATH}? (y/N): ").strip().lower()=="y": MODEL_PATH.unlink(); print("Deleted.")
-            else: print("No plaintext model.")
-            input("Enter...")
-        elif choice=="6": return
-        else: print("Invalid.")
-
-async def chat_session(state:dict):
-    if not ENCRYPTED_MODEL.exists(): print("No encrypted model found. Please download & encrypt first."); input("Enter..."); return
-    decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state['key'])
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            print("Loading model..."); llm = await loop.run_in_executor(ex, load_llama_model_blocking, MODEL_PATH)
-        except Exception as e:
-            print(f"Failed to load: {e}")
-            if MODEL_PATH.exists():
-                try: encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key']); MODEL_PATH.unlink()
-                except Exception: pass
-            input("Enter..."); return
-        state['model_loaded']=True
-        try:
-            await init_db(state['key'])
-            print("Type /exit to return, /history to show last 10 messages.")
-            while True:
-                prompt = input("\nYou> ").strip()
-                if not prompt: continue
-                if prompt in ("/exit","exit","quit"): break
-                if prompt=="/history":
-                    rows = await fetch_history(state['key'], limit=10)
-                    for r in rows: print(f"[{r[0]}] {r[1]}\nQ: {r[2]}\nA: {r[3]}\n{'-'*30}")
-                    continue
-                def gen(p):
-                    out = llm(p, max_tokens=256, temperature=0.7)
-                    text = ""
-                    if isinstance(out, dict):
-                        try: text = out.get("choices",[{"text":""}])[0].get("text","")
-                        except Exception: text = out.get("text","")
-                    else: text = str(out)
-                    text = (text or "").strip()
-                    text = text.replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face","").strip()
-                    return text
-                print("🤖 Thinking...")
-                result = await loop.run_in_executor(ex, gen, prompt)
-                print("\nModel:\n"+result+"\n")
-                await log_interaction(prompt, result, state['key'])
-        finally:
-            try: del llm
-            except Exception: pass
-            print("Re-encrypting model and removing plaintext...")
-            try: encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key']); MODEL_PATH.unlink(); state['model_loaded']=False
-            except Exception as e: print(f"Cleanup failed: {e}")
-            input("Enter...")
-
-async def road_scanner_flow(state:dict):
-    if not ENCRYPTED_MODEL.exists(): print("No encrypted model found."); input("Enter..."); return
-    data={}
-    clear_screen(); header(state)
-    print(boxed("Road Scanner - Step 1/6", ["Leave blank for defaults"]))
-    data['location'] = input("Location (e.g., 'I-95 NB mile 12'): ").strip() or "unspecified location"
-    data['road_type'] = input("Road type (highway/urban/residential): ").strip() or "highway"
-    data['weather'] = input("Weather/visibility: ").strip() or "clear"
-    data['traffic'] = input("Traffic density (low/med/high): ").strip() or "low"
-    data['obstacles'] = input("Reported obstacles: ").strip() or "none"
-    data['sensor_notes'] = input("Sensor notes: ").strip() or "none"
-    print("\nGeneration options:\n1) Chunked generation + punkd (recommended)\n2) Chunked only\n3) Direct single-call generation")
-    gen_choice = input("Choose (1-3) [1]: ").strip() or "1"
-    prompt = build_road_scanner_prompt(data, include_system_entropy=True)
-    decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, state['key'])
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            llm = await loop.run_in_executor(ex, load_llama_model_blocking, MODEL_PATH)
-        except Exception as e:
-            print(f"Model load failed: {e}")
-            if MODEL_PATH.exists():
-                try: encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key']); MODEL_PATH.unlink()
-                except Exception: pass
-            input("Enter..."); return
-        def gen_direct(p):
-            out = llm(p, max_tokens=128, temperature=0.2)
-            if isinstance(out, dict):
-                try: text = out.get("choices",[{"text":""}])[0].get("text","")
-                except Exception: text = out.get("text","")
-            else: text = str(out)
-            text = (text or "").strip()
-            return text.replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face","").strip()
-        if gen_choice == "3":
-            print("Scanning (single-call)...")
-            result = await loop.run_in_executor(ex, gen_direct, prompt)
-        else:
-            punkd_profile = "balanced" if gen_choice=="1" else "conservative"
-            print("Scanning with chunked generation (this may take a moment)...")
-            def run_chunked():
-                return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile=punkd_profile, streaming_callback=None)
-            result = await loop.run_in_executor(ex, run_chunked)
-        text = (result or "").strip().replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face","")
-        candidate = text.split()
-        label = candidate[0].capitalize() if candidate else ""
-        if label not in ("Low","Medium","High"):
-            lowered = text.lower()
-            if "low" in lowered: label = "Low"
-            elif "medium" in lowered: label = "Medium"
-            elif "high" in lowered: label = "High"
-            else: label = "Medium"
-        print("\n--- Road Scanner Result ---\n")
-        if label == "Low": print(color(label, fg=32, bold=True))
-        elif label == "Medium": print(color(label, fg=33, bold=True))
-        else: print(color(label, fg=31, bold=True))
-        print("\nOptions: 1) Re-run with edits  2) Export to JSON  3) Save & return  4) Cancel")
-        ch = input("Choose (1-4): ").strip()
-        if ch=="1":
-            print("Re-run: editing fields. Press Enter to keep current value.")
-            for k in list(data.keys()):
-                v = input(f"{k} [{data[k]}]: ").strip()
-                if v: data[k]=v
-            prompt = build_road_scanner_prompt(data, include_system_entropy=True)
-            print("Re-scanning...")
-            if gen_choice == "3": result = await loop.run_in_executor(ex, gen_direct, prompt)
-            else:
-                def run_chunked2(): return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile=punkd_profile, streaming_callback=None)
-                result = await loop.run_in_executor(ex, run_chunked2)
-            print("\n"+(result or ""))
-        if ch in ("2","3"):
-            try: await init_db(state['key']); await log_interaction("ROAD_SCANNER_PROMPT:\n"+prompt, "ROAD_SCANNER_RESULT:\n"+label, state['key'])
-            except Exception as e: print(f"Failed to log: {e}")
-        if ch=="2":
-            outp = {"input": data, "prompt": prompt, "result": label, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
-            fn = input("Filename to save JSON (default road_scan.json): ").strip() or "road_scan.json"
-            Path(fn).write_text(json.dumps(outp, indent=2)); print(f"Saved {fn}")
-        try: del llm
-        except Exception: pass
-        print("Re-encrypting model and removing plaintext...")
-        try: encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, state['key']); MODEL_PATH.unlink()
-        except Exception as e: print(f"Cleanup error: {e}")
-        input("Enter to return...")
-
-async def db_viewer_flow(state:dict):
-    if not DB_PATH.exists(): print("No DB found."); input("Enter..."); return
-    page=0; per_page=10; search=None
-    while True:
-        rows = await fetch_history(state['key'], limit=per_page, offset=page*per_page, search=search)
-        clear_screen(); header(state)
-        title = f"History (page {page+1})"
-        print(boxed(title, [f"Search: {search or '(none)'}", "Commands: n=next p=prev s=search q=quit"]))
-        if not rows: print("No rows on this page.")
-        else:
-            for r in rows: print(f"[{r[0]}] {r[1]}\nQ: {r[2]}\nA: {r[3]}\n" + "-"*60)
-        cmd = input("cmd (n/p/s/q): ").strip().lower()
-        if cmd=="n": page +=1
-        elif cmd=="p" and page>0: page -=1
-        elif cmd=="s": search = input("Enter search keyword (empty to clear): ").strip() or None; page = 0
-        else: break
-
-def rekey_flow(state:dict):
-    print("Rekey / Rotate Key")
-    if KEY_PATH.exists(): print(f"Current key file: {KEY_PATH}")
-    else: print("No existing key file (creating new).")
-    choice = input("1) New random key  2) Passphrase-derived  3) Cancel\nChoose: ").strip()
-    if choice not in ("1","2"): print("Canceled."); input("Enter..."); return
-    old_key = state['key']
-    tmp_model = MODELS_DIR / (MODEL_FILE + ".tmp"); tmp_db = Path("temp.db")
-    try:
-        if ENCRYPTED_MODEL.exists():
-            try: decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
-            except Exception as e: print(f"Failed to decrypt model with current key: {e}"); safe_cleanup([tmp_model,tmp_db]); input("Enter..."); return
-        if DB_PATH.exists():
-            try: decrypt_file(DB_PATH, tmp_db, old_key)
-            except Exception as e: print(f"Failed to decrypt DB with current key: {e}"); safe_cleanup([tmp_model,tmp_db]); input("Enter..."); return
-    except Exception as e:
-        print(f"Unexpected: {e}"); safe_cleanup([tmp_model,tmp_db]); input("Enter..."); return
-    if choice=="1":
-        new_key = AESGCM.generate_key(256); KEY_PATH.write_bytes(new_key); print("New random key generated and saved.")
-    else:
-        pw = getpass.getpass("Enter new passphrase: "); pw2 = getpass.getpass("Confirm: ")
-        if pw!=pw2: print("Mismatch."); safe_cleanup([tmp_model,tmp_db]); input("Enter..."); return
-        salt, derived = derive_key_from_passphrase(pw); KEY_PATH.write_bytes(salt + derived); new_key = derived; print("New passphrase-derived key saved (salt+derived).")
-    try:
-        if tmp_model.exists():
-            old_h = sha256_file(tmp_model)
-            encrypt_file(tmp_model, ENCRYPTED_MODEL, new_key)
-            new_h_enc = sha256_file(ENCRYPTED_MODEL)
-            print(f"Model plaintext SHA256: {old_h}")
-            print(f"Encrypted model SHA256: {new_h_enc}")
-        if tmp_db.exists():
-            old_db_h = sha256_file(tmp_db)
-            with tmp_db.open("rb") as f: DB_PATH.write_bytes(aes_encrypt(f.read(), new_key))
-            new_db_h = sha256_file(DB_PATH)
-            print(f"DB plaintext SHA256: {old_db_h}")
-            print(f"Encrypted DB SHA256: {new_db_h}")
-    except Exception as e: print(f"Error during re-encryption: {e}")
-    finally:
-        safe_cleanup([tmp_model,tmp_db])
-        state['key'] = KEY_PATH.read_bytes()[16:48] if KEY_PATH.exists() and len(KEY_PATH.read_bytes())>=48 else KEY_PATH.read_bytes()[:32]
-        print("Rekey attempt finished. Verify files manually."); input("Enter...")
-
-def safe_cleanup(paths:List[Path]):
-    for p in paths:
-        try:
-            if p.exists(): p.unlink()
-        except Exception: pass
-
-def main_menu_loop(state:dict):
-    options = ["Model Manager","Chat with model","Road Scanner","View chat history","Rekey / Rotate key","Exit"]
-    while True:
-        clear_screen(); header(state); print()
-        print(boxed("Main Menu", [f"{i+1}) {opt}" for i,opt in enumerate(options)]))
-        idx = read_menu_choice(len(options)); choice = options[idx]
-        if choice == "Model Manager": model_manager(state)
-        elif choice == "Chat with model": asyncio.run(chat_session(state))
-        elif choice == "Road Scanner": asyncio.run(road_scanner_flow(state))
-        elif choice == "View chat history": asyncio.run(db_viewer_flow(state))
-        elif choice == "Rekey / Rotate key": rekey_flow(state)
-        elif choice == "Exit": print("Goodbye."); return
-
-def main():
-    try: key = ensure_key_interactive()
-    except Exception: key = get_or_create_key()
-    state = {"key": key, "model_loaded": False}
-    try:
-        asyncio.run(init_db(state['key']))
-    except Exception: pass
-    try:
-        main_menu_loop(state)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-    finally:
-        show_cursor()
-
-# ---------------------------------------------------------------------------
-# MOBILE / KIVYMD HELPERS (non-destructive wrappers around your backend)
-# ---------------------------------------------------------------------------
 
 async def mobile_ensure_init() -> bytes:
-    """
-    Mobile-friendly init: ensure key + DB, no stdin / getpass prompts.
-    """
     key = get_or_create_key()
     try:
         await init_db(key)
@@ -856,274 +553,651 @@ async def mobile_ensure_init() -> bytes:
         pass
     return key
 
+@contextmanager
+def acquire_plain_model(key: bytes):
+    global _MODEL_USERS
+    with _MODEL_LOCK:
+        if ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
+            decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+        if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
+            raise FileNotFoundError("Model not found")
+        _MODEL_USERS += 1
+    try:
+        yield MODEL_PATH
+    finally:
+        with _MODEL_LOCK:
+            _MODEL_USERS = max(0, _MODEL_USERS - 1)
+            if _MODEL_USERS == 0 and ENCRYPTED_MODEL.exists() and MODEL_PATH.exists():
+                try:
+                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                    MODEL_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
 async def mobile_run_chat(prompt: str) -> str:
-    """
-    Run a single chat turn using your llama model, log to encrypted DB.
-    """
     key = await mobile_ensure_init()
-
-    # Decrypt model if encrypted version exists
-    if ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
-        decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
-
-    # If neither plaintext nor encrypted exist, bail
-    if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
+    try:
+        with acquire_plain_model(key) as model_path:
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                try:
+                    llm = await loop.run_in_executor(ex, load_llama_model_blocking, model_path)
+                except Exception as e:
+                    return f"[Error loading model: {e}]"
+                def gen(p):
+                    out = llm(p, max_tokens=256, temperature=0.7)
+                    text = ""
+                    if isinstance(out, dict):
+                        try:
+                            text = out.get("choices", [{"text": ""}])[0].get("text", "")
+                        except Exception:
+                            text = out.get("text", "")
+                    else:
+                        text = str(out)
+                    text = (text or "").strip()
+                    text = text.replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "").strip()
+                    return text
+                result = await loop.run_in_executor(ex, gen, prompt)
+                try:
+                    await log_interaction(prompt, result, key)
+                except Exception:
+                    pass
+                try:
+                    del llm
+                except Exception:
+                    pass
+                return result
+    except FileNotFoundError:
         return "[Model not found. Place or download the GGUF model on device.]"
 
-    if not MODEL_PATH.exists() and ENCRYPTED_MODEL.exists():
-        decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
-
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            llm = await loop.run_in_executor(ex, load_llama_model_blocking, MODEL_PATH)
-        except Exception as e:
-            return f"[Error loading model: {e}]"
-
-        def gen(p):
-            out = llm(p, max_tokens=256, temperature=0.7)
-            text = ""
-            if isinstance(out, dict):
-                try:
-                    text = out.get("choices", [{"text": ""}])[0].get("text", "")
-                except Exception:
-                    text = out.get("text", "")
-            else:
-                text = str(out)
-            text = (text or "").strip()
-            text = text.replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "").strip()
-            return text
-
-        result = await loop.run_in_executor(ex, gen, prompt)
-
-        try:
-            await log_interaction(prompt, result, key)
-        except Exception:
-            pass
-
-        try:
-            del llm
-        except Exception:
-            pass
-
-        # Re-encrypt model if encrypted version is being used
-        if ENCRYPTED_MODEL.exists():
-            try:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
-                if MODEL_PATH.exists():
-                    MODEL_PATH.unlink()
-            except Exception:
-                pass
-
-    return result
-
 async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
-    """
-    Run the Hypertime Nanobot Road Scanner with same prompt + quantum logic.
-    Returns (label, raw_model_text).
-    """
     key = await mobile_ensure_init()
     prompt = build_road_scanner_prompt(data, include_system_entropy=True)
-
-    if ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
-        decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
-
-    if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
+    try:
+        with acquire_plain_model(key) as model_path:
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                try:
+                    llm = await loop.run_in_executor(ex, load_llama_model_blocking, model_path)
+                except Exception as e:
+                    return "[Error]", f"[Error loading model: {e}]"
+                def run_chunked():
+                    return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile="balanced", streaming_callback=None)
+                result = await loop.run_in_executor(ex, run_chunked)
+                text = (result or "").strip().replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "")
+                candidate = text.split()
+                label = candidate[0].capitalize() if candidate else ""
+                if label not in ("Low", "Medium", "High"):
+                    lowered = text.lower()
+                    if "low" in lowered:
+                        label = "Low"
+                    elif "medium" in lowered:
+                        label = "Medium"
+                    elif "high" in lowered:
+                        label = "High"
+                    else:
+                        label = "Medium"
+                try:
+                    await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
+                except Exception:
+                    pass
+                try:
+                    del llm
+                except Exception:
+                    pass
+                return label, text
+    except FileNotFoundError:
         return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]"
 
-    if not MODEL_PATH.exists() and ENCRYPTED_MODEL.exists():
-        decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+class BackgroundGradient(Widget):
+    top_color = ListProperty([0.07, 0.09, 0.14, 1])
+    bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
+    steps = NumericProperty(44)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
+    def _lerp(self, a, b, t):
+        return a + (b - a) * t
+    def _redraw(self, *args):
+        self.canvas.before.clear()
+        x, y = self.pos
+        w, h = self.size
+        n = max(10, int(self.steps))
+        with self.canvas.before:
+            for i in range(n):
+                t = i / (n - 1)
+                r = self._lerp(self.top_color[0], self.bottom_color[0], t)
+                g = self._lerp(self.top_color[1], self.bottom_color[1], t)
+                b = self._lerp(self.top_color[2], self.bottom_color[2], t)
+                a = self._lerp(self.top_color[3], self.bottom_color[3], t)
+                Color(r, g, b, a)
+                Rectangle(pos=(x, y + (h * i / n)), size=(w, h / n + 1))
 
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        try:
-            llm = await loop.run_in_executor(ex, load_llama_model_blocking, MODEL_PATH)
-        except Exception as e:
-            return "[Error]", f"[Error loading model: {e}]"
+class GlassCard(Widget):
+    radius = NumericProperty(dp(26))
+    fill = ListProperty([1, 1, 1, 0.055])
+    border = ListProperty([1, 1, 1, 0.13])
+    highlight = ListProperty([1, 1, 1, 0.08])
+    _shine_x = NumericProperty(0.0)
+    _shine_alpha = NumericProperty(0.0)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, radius=self._redraw, fill=self._redraw, border=self._redraw, highlight=self._redraw, _shine_x=self._redraw, _shine_alpha=self._redraw)
+        Clock.schedule_once(lambda dt: self._start_shine(), 0.2)
+    def _start_shine(self):
+        self._shine_x = -0.3
+        self._shine_alpha = 0.0
+        anim = (Animation(_shine_alpha=0.22, duration=0.45, t="out_quad") & Animation(_shine_x=1.3, duration=1.1, t="out_cubic"))
+        anim2 = Animation(_shine_alpha=0.0, duration=0.40, t="out_quad")
+        loop = (anim + anim2)
+        loop.repeat = True
+        loop.start(self)
+    def _redraw(self, *args):
+        self.canvas.clear()
+        x, y = self.pos
+        w, h = self.size
+        r = float(self.radius)
+        with self.canvas:
+            Color(0, 0, 0, 0.22)
+            RoundedRectangle(pos=(x, y - dp(2)), size=(w, h + dp(3)), radius=[r])
+            Color(*self.fill)
+            RoundedRectangle(pos=(x, y), size=(w, h), radius=[r])
+            Color(*self.highlight)
+            RoundedRectangle(pos=(x + dp(1), y + h * 0.55), size=(w - dp(2), h * 0.45), radius=[r])
+            Color(*self.border)
+            Line(rounded_rectangle=[x, y, w, h, r], width=dp(1.1))
+            if self._shine_alpha > 0.001:
+                sx = x + w * self._shine_x
+                Color(1, 1, 1, float(self._shine_alpha))
+                Rectangle(pos=(sx, y), size=(w * 0.18, h))
 
-        def run_chunked():
-            return chunked_generate(
-                llm=llm,
-                prompt=prompt,
-                max_total_tokens=256,
-                chunk_tokens=64,
-                base_temperature=0.18,
-                punkd_profile="balanced",
-                streaming_callback=None,
-            )
+class RiskWheelNeo(Widget):
+    value = NumericProperty(0.5)
+    level = StringProperty("MEDIUM")
+    sweep = NumericProperty(0.0)
+    glow = NumericProperty(0.25)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, sweep=self._redraw, glow=self._redraw, level=self._redraw)
+        Clock.schedule_once(lambda dt: self._start_sweep(), 0.05)
+    def _start_sweep(self):
+        a = Animation(sweep=1.0, duration=2.2, t="linear")
+        a.repeat = True
+        a.start(self)
+        anim = Animation(glow=0.42, duration=0.9, t="in_out_quad") + Animation(glow=0.22, duration=0.9, t="in_out_quad")
+        anim.repeat = True
+        anim.start(self)
+    def set_level(self, level: str):
+        lvl = (level or "").strip().upper()
+        if lvl.startswith("LOW"):
+            target = 0.0
+            self.level = "LOW"
+        elif lvl.startswith("HIGH"):
+            target = 1.0
+            self.level = "HIGH"
+        else:
+            target = 0.5
+            self.level = "MEDIUM"
+        Animation.cancel_all(self, "value")
+        Animation(value=target, duration=0.55, t="out_cubic").start(self)
+    def _level_color(self):
+        if self.level == "LOW":
+            return (0.10, 0.90, 0.42)
+        if self.level == "HIGH":
+            return (0.98, 0.22, 0.30)
+        return (0.98, 0.78, 0.20)
+    def _redraw(self, *args):
+        self.canvas.clear()
+        cx, cy = self.center
+        r = min(self.width, self.height) * 0.41
+        thickness = max(dp(12), r * 0.16)
+        ang = -135.0 + 270.0 * float(self.value)
+        ang_rad = math.radians(ang)
+        sweep_ang = -135.0 + 270.0 * float(self.sweep)
+        sweep_width = 18.0
+        active_rgb = self._level_color()
+        pulse = float(self.glow)
+        segs = [
+            ("LOW",  (0.10, 0.85, 0.40), -135.0, -45.0),
+            ("MED",  (0.98, 0.78, 0.20),  -45.0,  45.0),
+            ("HIGH", (0.98, 0.22, 0.30),   45.0, 135.0),
+        ]
+        gap = 6.0
+        with self.canvas:
+            Color(1, 1, 1, 0.05)
+            Line(circle=(cx, cy, r + dp(10), -140, 140), width=dp(1.2))
+            Color(0.10, 0.12, 0.18, 0.65)
+            Line(circle=(cx, cy, r, -140, 140), width=thickness, cap="round")
+            for name, rgb, a0, a1 in segs:
+                a0g = a0 + gap / 2.0
+                a1g = a1 - gap / 2.0
+                active = (self.level == "LOW" and name == "LOW") or (self.level == "MEDIUM" and name == "MED") or (self.level == "HIGH" and name == "HIGH")
+                boost = 1.0 + (0.85 * pulse if active else 0.0)
+                for k in range(5, 0, -1):
+                    alpha = (0.05 + 0.03 * k) * boost
+                    Color(rgb[0], rgb[1], rgb[2], alpha)
+                    Line(circle=(cx, cy, r, a0g, a1g), width=thickness + dp(2.6 * k), cap="round")
+                Color(rgb[0], rgb[1], rgb[2], 0.78)
+                Line(circle=(cx, cy, r, a0g, a1g), width=thickness, cap="round")
+            Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.22 + 0.18 * pulse)
+            Line(circle=(cx, cy, r, sweep_ang - sweep_width/2.0, sweep_ang + sweep_width/2.0), width=thickness + dp(6), cap="round")
+            Color(1, 1, 1, 0.12)
+            Line(circle=(cx, cy, r, sweep_ang - sweep_width/5.0, sweep_ang + sweep_width/5.0), width=thickness - dp(2), cap="round")
+            nx = cx + math.cos(ang_rad) * (r * 0.92)
+            ny = cy + math.sin(ang_rad) * (r * 0.92)
+            Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.18 + 0.18 * pulse)
+            Line(points=[cx, cy, nx, ny], width=max(dp(3.2), thickness * 0.16), cap="round")
+            Color(0.97, 0.97, 0.99, 0.98)
+            Line(points=[cx, cy, nx, ny], width=max(dp(2), thickness * 0.10), cap="round")
+            Color(1, 1, 1, 0.08)
+            RoundedRectangle(pos=(cx - dp(18), cy - dp(18)), size=(dp(36), dp(36)), radius=[dp(18)])
+            Color(1, 1, 1, 0.18)
+            Line(rounded_rectangle=[cx - dp(18), cy - dp(18), dp(36), dp(36), dp(18)], width=dp(1.0))
+            Color(0.06, 0.07, 0.10, 0.9)
+            RoundedRectangle(pos=(cx - dp(12), cy - dp(12)), size=(dp(24), dp(24)), radius=[dp(12)])
 
-        result = await loop.run_in_executor(ex, run_chunked)
-        text = (result or "").strip().replace(
-            "You are a helpful AI assistant named SmolLM, trained by Hugging Face", ""
-        )
+KV = r"""
+<BackgroundGradient>:
+    size_hint: 1, 1
+<GlassCard>:
+    size_hint: 1, None
+<RiskWheelNeo>:
+    size_hint: None, None
 
-        candidate = text.split()
-        label = candidate[0].capitalize() if candidate else ""
-        if label not in ("Low", "Medium", "High"):
-            lowered = text.lower()
-            if "low" in lowered:
-                label = "Low"
-            elif "medium" in lowered:
-                label = "Medium"
-            elif "high" in lowered:
-                label = "High"
-            else:
-                label = "Medium"
-
-        try:
-            await log_interaction("ROAD_SCANNER_PROMPT:\n"+prompt, "ROAD_SCANNER_RESULT:\n"+label, key)
-        except Exception:
-            pass
-
-        try:
-            del llm
-        except Exception:
-            pass
-
-        if ENCRYPTED_MODEL.exists():
-            try:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
-                if MODEL_PATH.exists():
-                    MODEL_PATH.unlink()
-            except Exception:
-                pass
-
-    return label, text
-
-# ---------------------------------------------------------------------------
-# KIVYMD UI
-# ---------------------------------------------------------------------------
-from kivy.lang import Builder
-from kivy.clock import Clock
-from kivy.core.window import Window
-
-from kivymd.app import MDApp
-
-# Optional: set a sane default window size when running on desktop
-if hasattr(Window, "size"):
-    Window.size = (400, 700)
-
-KV = """
 MDScreen:
     MDBoxLayout:
         orientation: "vertical"
-
         MDToolbar:
             title: "Secure LLM Road Scanner"
             elevation: 10
-            left_action_items: [["chat", lambda x: app.switch_screen("chat")]]
-            right_action_items: [["road", lambda x: app.switch_screen("road")]]
-
         MDLabel:
             id: status_label
             text: ""
             size_hint_y: None
             height: "24dp"
             halign: "center"
-
         MDScreenManager:
             id: screen_manager
 
             MDScreen:
                 name: "chat"
-
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
                 MDBoxLayout:
                     orientation: "vertical"
-                    padding: "8dp"
-                    spacing: "8dp"
-
-                    ScrollView:
-                        MDLabel:
-                            id: chat_history
-                            text: ""
-                            markup: True
-                            size_hint_y: None
-                            height: self.texture_size[1]
-
-                    MDTextField:
-                        id: chat_input
-                        hint_text: "Type your message"
-                        multiline: False
-                        on_text_validate: app.on_chat_send()
-
-                    MDRaisedButton:
-                        text: "Send"
-                        size_hint_x: 1
-                        on_release: app.on_chat_send()
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        size_hint_y: 1
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "12dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            ScrollView:
+                                MDLabel:
+                                    id: chat_history
+                                    text: ""
+                                    markup: True
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
+                            MDTextField:
+                                id: chat_input
+                                hint_text: "Type your message"
+                                multiline: False
+                                on_text_validate: app.on_chat_send()
+                            MDRaisedButton:
+                                text: "Send"
+                                size_hint_x: 1
+                                on_release: app.on_chat_send()
 
             MDScreen:
                 name: "road"
-
+                BackgroundGradient:
+                    top_color: 0.07, 0.09, 0.14, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
                 MDBoxLayout:
                     orientation: "vertical"
-                    padding: "8dp"
-                    spacing: "8dp"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        size_hint_y: None
+                        height: "650dp"
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.055
+                            border: 1, 1, 1, 0.13
+                            highlight: 1, 1, 1, 0.08
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Road Risk Scanner"
+                                bold: True
+                                font_style: "H6"
+                                halign: "center"
+                                size_hint_y: None
+                                height: "32dp"
+                            MDBoxLayout:
+                                size_hint_y: None
+                                height: "250dp"
+                                padding: "6dp"
+                                RiskWheelNeo:
+                                    id: risk_wheel
+                                    size: "240dp", "240dp"
+                                    pos_hint: {"center_x": 0.5, "center_y": 0.55}
+                            MDLabel:
+                                id: risk_text
+                                text: "RISK: —"
+                                halign: "center"
+                                size_hint_y: None
+                                height: "22dp"
+                            MDTextField:
+                                id: loc_field
+                                hint_text: "Location (e.g., I-95 NB mile 12)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: road_type_field
+                                hint_text: "Road type (highway/urban/residential)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: weather_field
+                                hint_text: "Weather/visibility"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: traffic_field
+                                hint_text: "Traffic density (low/med/high)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: obstacles_field
+                                hint_text: "Reported obstacles"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: sensor_notes_field
+                                hint_text: "Sensor notes"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDRaisedButton:
+                                text: "Scan Risk"
+                                size_hint_x: 1
+                                on_release: app.on_scan()
+                            MDLabel:
+                                id: scan_result
+                                text: ""
+                                halign: "center"
+                                size_hint_y: None
+                                height: "24dp"
 
-                    MDTextField:
-                        id: loc_field
-                        hint_text: "Location (e.g., 'I-95 NB mile 12')"
+            MDScreen:
+                name: "model"
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Model Manager"
+                                bold: True
+                                font_style: "H6"
+                                size_hint_y: None
+                                height: "32dp"
+                            MDLabel:
+                                id: model_status
+                                text: "—"
+                                theme_text_color: "Secondary"
+                            MDProgressBar:
+                                id: model_progress
+                                value: 0
+                                max: 100
+                                type: "determinate"
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Download"
+                                    on_release: app.gui_model_download()
+                                MDRaisedButton:
+                                    text: "Verify SHA"
+                                    on_release: app.gui_model_verify()
+                                MDRaisedButton:
+                                    text: "Encrypt"
+                                    on_release: app.gui_model_encrypt()
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Decrypt"
+                                    on_release: app.gui_model_decrypt()
+                                MDRaisedButton:
+                                    text: "Delete plain"
+                                    on_release: app.gui_model_delete_plain()
+                                MDRaisedButton:
+                                    text: "Refresh"
+                                    on_release: app.gui_model_refresh()
 
-                    MDTextField:
-                        id: road_type_field
-                        hint_text: "Road type (highway/urban/residential)"
+            MDScreen:
+                name: "history"
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Chat History"
+                                bold: True
+                                font_style: "H6"
+                                size_hint_y: None
+                                height: "32dp"
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "48dp"
+                                MDTextField:
+                                    id: history_search
+                                    hint_text: "Search prompt/response"
+                                    mode: "fill"
+                                    fill_color: 1, 1, 1, 0.06
+                                MDRaisedButton:
+                                    text: "Search"
+                                    on_release: app.gui_history_search()
+                                MDRaisedButton:
+                                    text: "Clear"
+                                    on_release: app.gui_history_clear()
+                            MDLabel:
+                                id: history_meta
+                                text: "—"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "22dp"
+                            ScrollView:
+                                MDList:
+                                    id: history_list
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Prev"
+                                    on_release: app.gui_history_prev()
+                                MDRaisedButton:
+                                    text: "Next"
+                                    on_release: app.gui_history_next()
+                                MDRaisedButton:
+                                    text: "Refresh"
+                                    on_release: app.gui_history_refresh()
 
-                    MDTextField:
-                        id: weather_field
-                        hint_text: "Weather/visibility"
+            MDScreen:
+                name: "security"
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Security"
+                                bold: True
+                                font_style: "H6"
+                                size_hint_y: None
+                                height: "32dp"
+                            MDLabel:
+                                text: "Rotate the encryption key and re-encrypt model + DB."
+                                theme_text_color: "Secondary"
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "New random key"
+                                    on_release: app.gui_rekey_random()
+                                MDRaisedButton:
+                                    text: "Passphrase key"
+                                    on_release: app.gui_rekey_passphrase_dialog()
+                            MDProgressBar:
+                                id: rekey_progress
+                                value: 0
+                                max: 100
+                                type: "determinate"
+                            MDLabel:
+                                id: rekey_status
+                                text: "—"
+                                theme_text_color: "Secondary"
 
-                    MDTextField:
-                        id: traffic_field
-                        hint_text: "Traffic density (low/med/high)"
-
-                    MDTextField:
-                        id: obstacles_field
-                        hint_text: "Reported obstacles"
-
-                    MDTextField:
-                        id: sensor_notes_field
-                        hint_text: "Sensor notes"
-
-                    MDRaisedButton:
-                        text: "Scan risk"
-                        size_hint_x: 1
-                        on_release: app.on_scan()
-
-                    MDLabel:
-                        id: scan_result
-                        text: ""
-                        halign: "center"
+        MDBottomNavigation:
+            panel_color: 0.08,0.09,0.12,1
+            MDBottomNavigationItem:
+                name: "nav_chat"
+                text: "Chat"
+                icon: "chat"
+                on_tab_press: app.switch_screen("chat")
+            MDBottomNavigationItem:
+                name: "nav_road"
+                text: "Road"
+                icon: "road-variant"
+                on_tab_press: app.switch_screen("road")
+            MDBottomNavigationItem:
+                name: "nav_model"
+                text: "Model"
+                icon: "cube-outline"
+                on_tab_press: app.switch_screen("model")
+            MDBottomNavigationItem:
+                name: "nav_history"
+                text: "History"
+                icon: "history"
+                on_tab_press: app.switch_screen("history")
+            MDBottomNavigationItem:
+                name: "nav_security"
+                text: "Security"
+                icon: "shield-lock-outline"
+                on_tab_press: app.switch_screen("security")
 """
 
 class SecureLLMApp(MDApp):
     chat_history_text = ""
-
+    _hist_page = 0
+    _hist_per_page = 10
+    _hist_search = None
     def build(self):
         self.title = "Secure LLM Road Scanner"
         self.theme_cls.primary_palette = "Blue"
-        return Builder.load_string(KV)
-
-    # -----------------------------
-    # Screen switching
-    # -----------------------------
+        root = Builder.load_string(KV)
+        Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
+        Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
+        return root
     def switch_screen(self, name: str):
-        sm = self.root.ids.screen_manager
-        sm.current = name
-
-    # -----------------------------
-    # Status helpers
-    # -----------------------------
+        self.root.ids.screen_manager.current = name
     def set_status(self, text: str):
         self.root.ids.status_label.text = text
-
-    # -----------------------------
-    # Chat logic
-    # -----------------------------
+    def _run_bg(self, work_fn, done_fn=None, err_fn=None):
+        def runner():
+            try:
+                out = work_fn()
+                if done_fn:
+                    Clock.schedule_once(lambda dt: done_fn(out), 0)
+            except Exception as e:
+                if err_fn:
+                    Clock.schedule_once(lambda dt: err_fn(e), 0)
+                else:
+                    Clock.schedule_once(lambda dt: self.set_status(f"[Error] {e}"), 0)
+        threading.Thread(target=runner, daemon=True).start()
     def append_chat(self, who: str, msg: str):
         chat_screen = self.root.ids.screen_manager.get_screen("chat")
         label = chat_screen.ids.chat_history
         self.chat_history_text += f"[b]{who}>[/b] {msg}\n"
         label.text = self.chat_history_text
-
     def on_chat_send(self):
         chat_screen = self.root.ids.screen_manager.get_screen("chat")
         field = chat_screen.ids.chat_input
@@ -1134,21 +1208,15 @@ class SecureLLMApp(MDApp):
         self.append_chat("You", prompt)
         self.set_status("Thinking...")
         threading.Thread(target=self._chat_worker, args=(prompt,), daemon=True).start()
-
     def _chat_worker(self, prompt: str):
         try:
             result = asyncio.run(mobile_run_chat(prompt))
         except Exception as e:
             result = f"[Error: {e}]"
         Clock.schedule_once(lambda dt: self._chat_finish(result))
-
     def _chat_finish(self, reply: str):
         self.append_chat("Model", reply)
         self.set_status("")
-
-    # -----------------------------
-    # Road scanner logic
-    # -----------------------------
     def on_scan(self):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         data = {
@@ -1161,29 +1229,242 @@ class SecureLLMApp(MDApp):
         }
         self.set_status("Scanning road risk...")
         threading.Thread(target=self._scan_worker, args=(data,), daemon=True).start()
-
     def _scan_worker(self, data: dict):
         try:
             label, raw = asyncio.run(mobile_run_road_scan(data))
         except Exception as e:
             label, raw = "[Error]", f"[Error: {e}]"
         Clock.schedule_once(lambda dt: self._scan_finish(label, raw))
-
     def _scan_finish(self, label: str, raw: str):
         road_screen = self.root.ids.screen_manager.get_screen("road")
-        if label == "Low":
-            disp = f"[LOW] {label}"
-        elif label == "Medium":
-            disp = f"[MEDIUM] {label}"
-        elif label == "High":
-            disp = f"[HIGH] {label}"
-        else:
-            disp = label
-        road_screen.ids.scan_result.text = disp
+        try:
+            road_screen.ids.risk_wheel.set_level(label)
+            road_screen.ids.risk_text.text = f"RISK: {label.upper()}"
+        except Exception:
+            pass
+        road_screen.ids.scan_result.text = label
         self.set_status("")
+    def gui_model_refresh(self):
+        s = []
+        s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
+        s.append(f"Plain: {'YES' if MODEL_PATH.exists() else 'no'}")
+        s.append(f"Key: {'YES' if KEY_PATH.exists() else 'no'}")
+        if MODEL_PATH.exists():
+            s.append(f"PlainMB: {MODEL_PATH.stat().st_size/1024/1024:.1f}")
+        if ENCRYPTED_MODEL.exists():
+            s.append(f"EncMB: {ENCRYPTED_MODEL.stat().st_size/1024/1024:.1f}")
+        self.root.ids.model_status.text = " | ".join(s)
+        self.root.ids.model_progress.value = 0
+    def gui_model_download(self):
+        self.set_status("Downloading...")
+        self.root.ids.model_progress.value = 0
+        url = MODEL_REPO + MODEL_FILE
+        def work():
+            get_or_create_key()
+            def cb(done, total):
+                if total > 0:
+                    pct = int(done * 100 / total)
+                    Clock.schedule_once(lambda dt: setattr(self.root.ids.model_progress, "value", pct), 0)
+            sha = download_model_httpx_with_cb(url, MODEL_PATH, progress_cb=cb, timeout=None)
+            return sha
+        def done(sha):
+            self.set_status("")
+            self.gui_model_refresh()
+            ok = (sha.lower() == EXPECTED_HASH.lower())
+            self.root.ids.model_status.text = f"Downloaded SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
+        def err(e):
+            self.set_status("")
+            self.root.ids.model_status.text = f"Download failed: {e}"
+        self._run_bg(work, done, err)
+    def gui_model_verify(self):
+        if not MODEL_PATH.exists():
+            self.root.ids.model_status.text = "No plaintext model."
+            return
+        self.set_status("Hashing...")
+        def work():
+            return sha256_file(MODEL_PATH)
+        def done(sha):
+            self.set_status("")
+            ok = (sha.lower() == EXPECTED_HASH.lower())
+            self.root.ids.model_status.text = f"Plain SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
+        self._run_bg(work, done)
+    def gui_model_encrypt(self):
+        if not MODEL_PATH.exists():
+            self.root.ids.model_status.text = "No plaintext model."
+            return
+        self.set_status("Encrypting...")
+        def work():
+            key = get_or_create_key()
+            with _MODEL_LOCK:
+                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+            return True
+        def done(_):
+            self.set_status("")
+            self.gui_model_refresh()
+            self.root.ids.model_status.text = "Encrypted model created."
+        def err(e):
+            self.set_status("")
+            self.root.ids.model_status.text = f"Encrypt failed: {e}"
+        self._run_bg(work, done, err)
+    def gui_model_decrypt(self):
+        if not ENCRYPTED_MODEL.exists():
+            self.root.ids.model_status.text = "No encrypted model."
+            return
+        self.set_status("Decrypting...")
+        def work():
+            key = get_or_create_key()
+            with _MODEL_LOCK:
+                decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+            return True
+        def done(_):
+            self.set_status("")
+            self.gui_model_refresh()
+            self.root.ids.model_status.text = "Plaintext model present."
+        def err(e):
+            self.set_status("")
+            self.root.ids.model_status.text = f"Decrypt failed: {e}"
+        self._run_bg(work, done, err)
+    def gui_model_delete_plain(self):
+        with _MODEL_LOCK:
+            if not MODEL_PATH.exists():
+                self.root.ids.model_status.text = "No plaintext model."
+                return
+            try:
+                MODEL_PATH.unlink()
+                self.gui_model_refresh()
+                self.root.ids.model_status.text = "Plaintext model deleted."
+            except Exception as e:
+                self.root.ids.model_status.text = f"Delete failed: {e}"
+    def gui_history_refresh(self):
+        self.set_status("Loading history...")
+        self.root.ids.history_list.clear_widgets()
+        page = self._hist_page
+        per_page = self._hist_per_page
+        search = self._hist_search
+        def work():
+            key = get_or_create_key()
+            asyncio.run(init_db(key))
+            rows = asyncio.run(fetch_history(key, limit=per_page, offset=page * per_page, search=search))
+            return rows
+        def done(rows):
+            self.set_status("")
+            self.root.ids.history_meta.text = f"Page {self._hist_page+1} | search={self._hist_search or '—'} | rows={len(rows)}"
+            if not rows:
+                self.root.ids.history_list.add_widget(TwoLineListItem(text="No results", secondary_text="—"))
+                return
+            for (rid, ts, prompt, resp) in rows:
+                self.root.ids.history_list.add_widget(
+                    TwoLineListItem(
+                        text=f"[{rid}] {ts}",
+                        secondary_text=(prompt[:80].replace("\n", " ") + ("…" if len(prompt) > 80 else "")),
+                        on_release=lambda item, rid=rid, ts=ts, prompt=prompt, resp=resp: self._history_show_dialog(rid, ts, prompt, resp),
+                    )
+                )
+        def err(e):
+            self.set_status("")
+            self.root.ids.history_meta.text = f"History error: {e}"
+        self._run_bg(work, done, err)
+    def _history_show_dialog(self, rid, ts, prompt, resp):
+        body = f"[{rid}] {ts}\n\nQ:\n{prompt}\n\nA:\n{resp}"
+        dlg = MDDialog(title="History Entry", text=body, buttons=[MDFlatButton(text="Close", on_release=lambda x: dlg.dismiss())])
+        dlg.open()
+    def gui_history_next(self):
+        self._hist_page += 1
+        self.gui_history_refresh()
+    def gui_history_prev(self):
+        if self._hist_page > 0:
+            self._hist_page -= 1
+        self.gui_history_refresh()
+    def gui_history_search(self):
+        s = self.root.ids.history_search.text.strip()
+        self._hist_search = s or None
+        self._hist_page = 0
+        self.gui_history_refresh()
+    def gui_history_clear(self):
+        self.root.ids.history_search.text = ""
+        self._hist_search = None
+        self._hist_page = 0
+        self.gui_history_refresh()
+    def _gui_rekey_common(self, make_new_key_fn: Callable[[], bytes]):
+        self.set_status("Rekeying...")
+        self.root.ids.rekey_progress.value = 5
+        self.root.ids.rekey_status.text = "Decrypting..."
+        def work():
+            with _MODEL_LOCK, _CRYPTO_LOCK:
+                old_key = get_or_create_key()
+                tmp_model = _tmp_path("model_rekey", ".gguf")
+                tmp_db = _tmp_path("db_rekey", ".db")
+                wrote_model = False
+                wrote_db = False
+                try:
+                    if ENCRYPTED_MODEL.exists():
+                        decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
+                    if DB_PATH.exists():
+                        decrypt_file(DB_PATH, tmp_db, old_key)
+                    new_key = make_new_key_fn()
+                    Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 55), 0)
+                    if tmp_model.exists():
+                        enc = aes_encrypt(tmp_model.read_bytes(), new_key)
+                        _atomic_write_bytes(ENCRYPTED_MODEL, enc)
+                        wrote_model = True
+                    Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 80), 0)
+                    if tmp_db.exists():
+                        encdb = aes_encrypt(tmp_db.read_bytes(), new_key)
+                        _atomic_write_bytes(DB_PATH, encdb)
+                        wrote_db = True
+                    return True
+                finally:
+                    try:
+                        tmp_model.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        tmp_db.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        def done(_):
+            self.set_status("")
+            self.root.ids.rekey_progress.value = 100
+            self.root.ids.rekey_status.text = "Rekey complete."
+            self.gui_model_refresh()
+        def err(e):
+            self.set_status("")
+            self.root.ids.rekey_progress.value = 0
+            self.root.ids.rekey_status.text = f"Rekey failed: {e}"
+        self._run_bg(work, done, err)
+    def gui_rekey_random(self):
+        def make_new_key():
+            new_key = AESGCM.generate_key(256)
+            _atomic_write_bytes(KEY_PATH, new_key)
+            return new_key
+        self._gui_rekey_common(make_new_key)
+    def gui_rekey_passphrase_dialog(self):
+        box = MDBoxLayout(orientation="vertical", spacing="12dp", padding="12dp", adaptive_height=True)
+        pass_field = MDTextField(hint_text="Passphrase", password=True)
+        pass2_field = MDTextField(hint_text="Confirm passphrase", password=True)
+        box.add_widget(pass_field)
+        box.add_widget(pass2_field)
+        dlg = MDDialog(
+            title="Passphrase Rekey",
+            type="custom",
+            content_cls=box,
+            buttons=[
+                MDFlatButton(text="Cancel", on_release=lambda x: dlg.dismiss()),
+                MDFlatButton(text="Rekey", on_release=lambda x: self._do_pass_rekey(dlg, pass_field.text, pass2_field.text)),
+            ],
+        )
+        dlg.open()
+    def _do_pass_rekey(self, dlg, pw1: str, pw2: str):
+        if (pw1 or "") != (pw2 or "") or not (pw1 or "").strip():
+            self.root.ids.rekey_status.text = "Passphrase mismatch or empty."
+            return
+        dlg.dismiss()
+        pw = pw1.strip()
+        def make_new_key():
+            salt, derived = derive_key_from_passphrase(pw)
+            _atomic_write_bytes(KEY_PATH, salt + derived)
+            return derived
+        self._gui_rekey_common(make_new_key)
 
-# ---------------------------------------------------------------------------
-# ANDROID / KIVY ENTRYPOINT
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     SecureLLMApp().run()

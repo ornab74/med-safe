@@ -1017,8 +1017,8 @@ KV = r"""
 MDScreen:
     MDBoxLayout:
         orientation: "vertical"
-        MDToolbar:
-            title: "Secure LLM Road Scanner"
+        MDTopAppBar:
+            title: "Road Safe"
             elevation: 10
         MDLabel:
             id: status_label

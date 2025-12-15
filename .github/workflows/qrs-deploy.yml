@@ -1,3 +1,4 @@
+
 name: Build Android (Debug / Release)
 
 on:
@@ -11,10 +12,11 @@ jobs:
     name: Python tests (tests.py)
     runs-on: ubuntu-22.04
     env:
-      KIVY_NO_ARGS: "1"
-      KIVY_WINDOW: "mock"
-      KIVY_AUDIO: "mock"
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}
+      KIVY_NO_ARGS: "1"
+      KIVY_HOME: ${{ runner.temp }}/kivy
+      KIVY_NO_CONSOLELOG: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -22,31 +24,36 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install system dependencies (Kivy + crypto)
+      - name: Install system dependencies (Xvfb + SDL2 stack for Kivy)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential git \
+            xvfb \
             libgl1-mesa-dev \
+            libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libsdl2-mixer-dev \
             libjpeg-dev libfreetype6-dev \
             libssl-dev libffi-dev libsqlite3-dev \
             zlib1g-dev
 
-      - name: Install Python deps (tests)
+      - name: Install Python deps (latest Kivy + KivyMD master)
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
-          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
+          pip install --upgrade kivy
+          pip install --upgrade https://github.com/kivymd/KivyMD/archive/master.zip
+          pip install httpx cryptography aiosqlite psutil pennylane
+          python -c "import kivy; print('Kivy:', kivy.__version__)"
 
       - name: Run tests (tests.py)
         run: |
-          python -m unittest -v tests
+          mkdir -p "$KIVY_HOME"
+          xvfb-run -a -s "-screen 0 1280x720x24" python -m unittest -v tests
 
   build:
     name: Build Android
     needs: tests
     runs-on: ubuntu-22.04
-
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
@@ -108,12 +115,11 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Install Buildozer & Python deps
+      - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
-          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
@@ -154,4 +160,3 @@ jobs:
           name: QRS-Android-APK-Debug
           path: bin/*.apk
           if-no-files-found: warn
-

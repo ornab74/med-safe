@@ -26,14 +26,60 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           echo "KIVY_NO_ARGS=1" >> "$GITHUB_ENV"
           echo "KIVY_NO_CONSOLELOG=1" >> "$GITHUB_ENV"
+          echo "KIVY_WINDOW=mock" >> "$GITHUB_ENV"
           echo "KIVY_HOME=$RUNNER_TEMP/kivy" >> "$GITHUB_ENV"
+
+      - name: Pick fastest Ubuntu mirror (7-way)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODENAME="$(lsb_release -sc)"
+          TEST_PATH="dists/${CODENAME}/InRelease"
+          MIRRORS=(
+            "http://azure.archive.ubuntu.com/ubuntu"
+            "http://archive.ubuntu.com/ubuntu"
+            "http://security.ubuntu.com/ubuntu"
+            "https://mirrors.edge.kernel.org/ubuntu"
+            "https://mirrors.ocf.berkeley.edu/ubuntu"
+            "https://ftp.osuosl.org/pub/ubuntu"
+            "https://mirror.csclub.uwaterloo.ca/ubuntu"
+          )
+          best=""
+          best_ms=999999
+          for m in "${MIRRORS[@]}"; do
+            url="${m}/${TEST_PATH}"
+            t="$(curl -fsS -o /dev/null -w '%{time_starttransfer}' --connect-timeout 3 --max-time 8 "$url" 2>/dev/null || echo 9999)"
+            ms="$(python - <<PY
+t=float("${t}")
+print(int(t*1000))
+PY
+)"
+            echo "${ms}ms  ${m}"
+            if [ "$ms" -lt "$best_ms" ]; then
+              best_ms="$ms"
+              best="$m"
+            fi
+          done
+          echo "BEST_MIRROR=$best ($best_ms ms)"
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i \
+              -e "s|http://azure.archive.ubuntu.com/ubuntu|$best|g" \
+              -e "s|http://archive.ubuntu.com/ubuntu|$best|g" \
+              -e "s|https://archive.ubuntu.com/ubuntu|$best|g" \
+              /etc/apt/sources.list
+          fi
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i -e "s|URIs: .*|URIs: $best|g" /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
 
       - name: Install system dependencies
         shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
           set -e
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential git \
             xvfb \
             libgl1-mesa-dev \
@@ -56,9 +102,15 @@ jobs:
       - name: Run tests
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          echo "RUNNER_TEMP=$RUNNER_TEMP"
           echo "KIVY_HOME=$KIVY_HOME"
+          python -V
+          which xvfb-run || true
+          ls -ld "$(dirname "$KIVY_HOME")" || true
           mkdir -p "$KIVY_HOME"
+          ls -ld "$KIVY_HOME"
           xvfb-run -a -s "-screen 0 1280x720x24" python -m unittest -v tests
 
   build:
@@ -81,6 +133,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+
+      - name: Cache Buildozer / p4a / Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            .buildozer
+            ~/.buildozer
+            ~/.local/share/python-for-android
+            ~/.gradle
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-buildozer-
 
       - name: Install system dependencies
         shell: bash

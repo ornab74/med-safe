@@ -9,9 +9,9 @@ package.domain = com.qroadscan
 source.dir = .
 source.main = main.py
 
-version = 0.1.3
+version = 0.1.4
 
-android.version_code = 1024003
+android.version_code = 1024005
 
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 

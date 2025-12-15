@@ -1,10 +1,3 @@
-# Single-file app (chat UI + chat-to-model removed)
-# Keeps: Road Risk Scanner, Model Manager, History, Security, Debug
-# Notes:
-# - DB is AESGCM(nonce+ciphertext) bytes (consistent)
-# - llama_cpp is lazy-imported (avoids native import crash at splash)
-# - Rekey flow handles DB with aes_decrypt/aes_encrypt (not decrypt_file)
-
 import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor

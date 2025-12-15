@@ -1,7 +1,7 @@
 
 [app]
 
-title = Secure LLM Road Scanner
+title = Road Safe
 
 package.name = securellmroads
 package.domain = com.qroadscan

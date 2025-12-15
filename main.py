@@ -1,3 +1,4 @@
+
 import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from threading import RLock
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -123,7 +125,7 @@ MODELS_DIR = (BASE_DIR / "models")
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
 
-DB_PATH = (BASE_DIR / "chat_history.db.aes")  # AESGCM(nonce+ciphertext) bytes
+DB_PATH = (BASE_DIR / "chat_history.db.aes")
 KEY_PATH = (BASE_DIR / ".enc_key_wrapped")
 LOG_PATH = (BASE_DIR / "debug.log")
 TMP_DIR = (BASE_DIR / "tmp")
@@ -202,6 +204,49 @@ def _atomic_write_bytes(path: Path, data: bytes):
 
 def _tmp_path(prefix: str, suffix: str) -> Path:
     return TMP_DIR / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
+
+
+def _cleanup_tmp_dir():
+    try:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        patterns = [
+            "hist_*.db",
+            "db_rekey*.db",
+            "model_rekey*.gguf",
+            "*.dl.*",
+            "*.enc.*",
+            "*.dec.*",
+        ]
+        removed = 0
+        for pat in patterns:
+            for p in TMP_DIR.glob(pat):
+                try:
+                    p.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+        if removed:
+            logger.info("tmp cleanup removed=%d", removed)
+    except Exception:
+        pass
+
+
+def _derive_subkey(master_key: bytes, info: bytes) -> bytes:
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=info,
+    )
+    return hkdf.derive(master_key)
+
+
+def _db_key(master_key: bytes) -> bytes:
+    return _derive_subkey(master_key, b"qroadscan/db/v1")
+
+
+def _model_key(master_key: bytes) -> bytes:
+    return _derive_subkey(master_key, b"qroadscan/model/v1")
 
 
 def aes_encrypt(data: bytes, key: bytes) -> bytes:
@@ -404,27 +449,6 @@ def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 102
             tmp.replace(dest)
 
 
-async def init_db(key: bytes):
-    with _CRYPTO_LOCK:
-        if DB_PATH.exists():
-            return
-        tmp_plain = _tmp_path("hist_init", ".db")
-        try:
-            async with aiosqlite.connect(str(tmp_plain)) as db:
-                await db.execute(
-                    "CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)"
-                )
-                await db.commit()
-            enc = aes_encrypt(tmp_plain.read_bytes(), key)
-            _atomic_write_bytes(DB_PATH, enc)
-            logger.info("db init ok")
-        finally:
-            try:
-                tmp_plain.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
 def _mark_corrupt(path: Path):
     try:
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -437,12 +461,13 @@ def _mark_corrupt(path: Path):
             pass
 
 
-def _safe_decrypt_db_to(tmp_plain: Path, key: bytes) -> bool:
+def _safe_decrypt_db_to(tmp_plain: Path, master_key: bytes) -> bool:
     if not DB_PATH.exists():
         return False
     try:
-        pt = aes_decrypt(DB_PATH.read_bytes(), key)
-        _atomic_write_bytes(tmp_plain, pt)
+        with _CRYPTO_LOCK:
+            pt = aes_decrypt(DB_PATH.read_bytes(), _db_key(master_key))
+            _atomic_write_bytes(tmp_plain, pt)
         return True
     except InvalidTag:
         logger.warning("db decrypt invalid tag, marked corrupt")
@@ -453,78 +478,96 @@ def _safe_decrypt_db_to(tmp_plain: Path, key: bytes) -> bool:
         return False
 
 
-async def log_interaction(prompt: str, response: str, key: bytes):
+def _encrypt_db_from_plain(tmp_plain: Path, master_key: bytes):
     with _CRYPTO_LOCK:
-        if not DB_PATH.exists():
-            await init_db(key)
+        enc = aes_encrypt(tmp_plain.read_bytes(), _db_key(master_key))
+        _atomic_write_bytes(DB_PATH, enc)
 
-        tmp_plain = _tmp_path("hist_work", ".db")
+
+async def init_db(master_key: bytes):
+    if DB_PATH.exists():
+        return
+    tmp_plain = _tmp_path("hist_init", ".db")
+    try:
+        async with aiosqlite.connect(str(tmp_plain)) as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)"
+            )
+            await db.commit()
+        _encrypt_db_from_plain(tmp_plain, master_key)
+        logger.info("db init ok")
+    finally:
         try:
-            if not _safe_decrypt_db_to(tmp_plain, key):
-                await init_db(key)
-                if not _safe_decrypt_db_to(tmp_plain, key):
-                    return
-
-            async with aiosqlite.connect(str(tmp_plain)) as db:
-                await db.execute(
-                    "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
-                    (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
-                )
-                await db.commit()
-
-            enc = aes_encrypt(tmp_plain.read_bytes(), key)
-            _atomic_write_bytes(DB_PATH, enc)
-        finally:
-            try:
-                tmp_plain.unlink(missing_ok=True)
-            except Exception:
-                pass
+            tmp_plain.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Optional[str] = None):
-    with _CRYPTO_LOCK:
-        if not DB_PATH.exists():
-            await init_db(key)
+async def log_interaction(prompt: str, response: str, master_key: bytes):
+    if not DB_PATH.exists():
+        await init_db(master_key)
 
-        tmp_plain = _tmp_path("hist_read", ".db")
-        rows = []
+    tmp_plain = _tmp_path("hist_work", ".db")
+    try:
+        if not _safe_decrypt_db_to(tmp_plain, master_key):
+            await init_db(master_key)
+            if not _safe_decrypt_db_to(tmp_plain, master_key):
+                return
+
+        async with aiosqlite.connect(str(tmp_plain)) as db:
+            await db.execute(
+                "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
+                (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
+            )
+            await db.commit()
+
+        _encrypt_db_from_plain(tmp_plain, master_key)
+    finally:
         try:
-            if not _safe_decrypt_db_to(tmp_plain, key):
-                await init_db(key)
-                if not _safe_decrypt_db_to(tmp_plain, key):
-                    return []
-
-            async with aiosqlite.connect(str(tmp_plain)) as db:
-                if search:
-                    q = f"%{search}%"
-                    async with db.execute(
-                        "SELECT id,timestamp,prompt,response FROM history WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                        (q, q, limit, offset),
-                    ) as cur:
-                        async for r in cur:
-                            rows.append(r)
-                else:
-                    async with db.execute(
-                        "SELECT id,timestamp,prompt,response FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
-                        (limit, offset),
-                    ) as cur:
-                        async for r in cur:
-                            rows.append(r)
-
-            enc = aes_encrypt(tmp_plain.read_bytes(), key)
-            _atomic_write_bytes(DB_PATH, enc)
-        finally:
-            try:
-                tmp_plain.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        return rows
+            tmp_plain.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-# ---- llama_cpp lazy import ----
+async def fetch_history(master_key: bytes, limit: int = 20, offset: int = 0, search: Optional[str] = None):
+    if not DB_PATH.exists():
+        await init_db(master_key)
+
+    tmp_plain = _tmp_path("hist_read", ".db")
+    rows = []
+    try:
+        if not _safe_decrypt_db_to(tmp_plain, master_key):
+            await init_db(master_key)
+            if not _safe_decrypt_db_to(tmp_plain, master_key):
+                return []
+
+        async with aiosqlite.connect(str(tmp_plain)) as db:
+            if search:
+                q = f"%{search}%"
+                async with db.execute(
+                    "SELECT id,timestamp,prompt,response FROM history WHERE prompt LIKE ? OR response LIKE ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (q, q, limit, offset),
+                ) as cur:
+                    async for r in cur:
+                        rows.append(r)
+            else:
+                async with db.execute(
+                    "SELECT id,timestamp,prompt,response FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ) as cur:
+                    async for r in cur:
+                        rows.append(r)
+    finally:
+        try:
+            tmp_plain.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return rows
+
+
 def _get_llama_class():
-    from llama_cpp import Llama  # noqa
+    from llama_cpp import Llama
     return Llama
 
 
@@ -911,20 +954,22 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
 
 
 async def mobile_ensure_init() -> bytes:
-    key = get_or_create_key()
+    master = get_or_create_key()
     try:
-        await init_db(key)
+        await init_db(master)
     except Exception:
         logger.exception("init db failed")
-    return key
+    _cleanup_tmp_dir()
+    return master
 
 
 @contextmanager
-def acquire_plain_model(key: bytes):
+def acquire_plain_model(master_key: bytes):
     global _MODEL_USERS
+    mkey = _model_key(master_key)
     with _MODEL_LOCK:
         if ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
-            decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+            decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, mkey)
             logger.info("model decrypted to plaintext")
         if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
             raise FileNotFoundError("Model not found")
@@ -937,7 +982,7 @@ def acquire_plain_model(key: bytes):
             _MODEL_USERS = max(0, _MODEL_USERS - 1)
             if _MODEL_USERS == 0 and ENCRYPTED_MODEL.exists() and MODEL_PATH.exists():
                 try:
-                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, mkey)
                     MODEL_PATH.unlink(missing_ok=True)
                     logger.info("model re-encrypted and plaintext deleted")
                 except Exception:
@@ -945,11 +990,11 @@ def acquire_plain_model(key: bytes):
 
 
 async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
-    key = await mobile_ensure_init()
+    master = await mobile_ensure_init()
     prompt = build_road_scanner_prompt(data, include_system_entropy=True)
 
     try:
-        with acquire_plain_model(key) as model_path:
+        with acquire_plain_model(master) as model_path:
             loop = asyncio.get_running_loop()
             with ThreadPoolExecutor(max_workers=1) as ex:
                 try:
@@ -986,7 +1031,7 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                         label = "Medium"
 
                 try:
-                    await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
+                    await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, master)
                 except Exception:
                     logger.exception("log interaction failed")
 
@@ -1560,6 +1605,7 @@ class SecureLLMApp(MDApp):
         return root
 
     def on_start(self):
+        _cleanup_tmp_dir()
         logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
         try:
             self.root.ids.screen_manager.current = "road"
@@ -1600,7 +1646,6 @@ class SecureLLMApp(MDApp):
 
         threading.Thread(target=runner, daemon=True).start()
 
-    # ---- Road scan ----
     def on_scan(self):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         data = {
@@ -1611,19 +1656,20 @@ class SecureLLMApp(MDApp):
             "obstacles": road_screen.ids.obstacles_field.text.strip() or "none",
             "sensor_notes": road_screen.ids.sensor_notes_field.text.strip() or "none",
         }
+        scan_id = uuid.uuid4().hex[:10]
         self.set_status("Scanning road risk...")
-        logger.info("road scan req %s", json.dumps(data, ensure_ascii=False))
-        threading.Thread(target=self._scan_worker, args=(data,), daemon=True).start()
+        logger.info("road scan req id=%s fields=%s", scan_id, ",".join(sorted([k for k in data.keys()])))
+        threading.Thread(target=self._scan_worker, args=(data, scan_id), daemon=True).start()
 
-    def _scan_worker(self, data: dict):
+    def _scan_worker(self, data: dict, scan_id: str):
         try:
             label, raw = asyncio.run(mobile_run_road_scan(data))
         except Exception as e:
-            logger.exception("scan worker failed")
+            logger.exception("scan worker failed id=%s", scan_id)
             label, raw = "[Error]", f"[Error: {e}]"
-        Clock.schedule_once(lambda dt: self._scan_finish(label, raw), 0)
+        Clock.schedule_once(lambda dt: self._scan_finish(label, raw, scan_id), 0)
 
-    def _scan_finish(self, label: str, raw: str):
+    def _scan_finish(self, label: str, raw: str, scan_id: str):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         try:
             road_screen.ids.risk_wheel.set_level(label)
@@ -1632,9 +1678,8 @@ class SecureLLMApp(MDApp):
             pass
         road_screen.ids.scan_result.text = label
         self.set_status("")
-        logger.info("road scan done label=%s raw_len=%d", label, len(raw or ""))
+        logger.info("road scan done id=%s label=%s raw_len=%d", scan_id, label, len(raw or ""))
 
-    # ---- Model manager ----
     def gui_model_refresh(self):
         s = []
         s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
@@ -1656,9 +1701,17 @@ class SecureLLMApp(MDApp):
         def work():
             get_or_create_key()
 
+            last_pct = {"v": -1}
+            last_t = {"v": 0.0}
+
             def cb(done, total):
-                if total > 0:
-                    pct = int(done * 100 / total)
+                if total <= 0:
+                    return
+                pct = int(done * 100 / total)
+                now = time.time()
+                if pct != last_pct["v"] and (pct == 100 or now - last_t["v"] > 0.12):
+                    last_pct["v"] = pct
+                    last_t["v"] = now
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.model_progress, "value", pct), 0)
 
             sha = download_model_httpx_with_cb(url, MODEL_PATH, progress_cb=cb, timeout=None)
@@ -1702,9 +1755,9 @@ class SecureLLMApp(MDApp):
         self.set_status("Encrypting...")
 
         def work():
-            key = get_or_create_key()
+            master = get_or_create_key()
             with _MODEL_LOCK:
-                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, _model_key(master))
             return True
 
         def done(_):
@@ -1727,9 +1780,9 @@ class SecureLLMApp(MDApp):
         self.set_status("Decrypting...")
 
         def work():
-            key = get_or_create_key()
+            master = get_or_create_key()
             with _MODEL_LOCK:
-                decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+                decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, _model_key(master))
             return True
 
         def done(_):
@@ -1759,7 +1812,6 @@ class SecureLLMApp(MDApp):
                 self.root.ids.model_status.text = f"Delete failed: {e}"
                 logger.exception("model plaintext delete failed")
 
-    # ---- History ----
     def gui_history_refresh(self):
         self.set_status("Loading history...")
         self.root.ids.history_list.clear_widgets()
@@ -1768,9 +1820,9 @@ class SecureLLMApp(MDApp):
         search = self._hist_search
 
         def work():
-            key = get_or_create_key()
-            asyncio.run(init_db(key))
-            rows = asyncio.run(fetch_history(key, limit=per_page, offset=page * per_page, search=search))
+            master = get_or_create_key()
+            asyncio.run(init_db(master))
+            rows = asyncio.run(fetch_history(master, limit=per_page, offset=page * per_page, search=search))
             return rows
 
         def done(rows):
@@ -1821,47 +1873,68 @@ class SecureLLMApp(MDApp):
         self._hist_page = 0
         self.gui_history_refresh()
 
-    # ---- Rekey ----
-    def _gui_rekey_common(self, make_new_key_fn: Callable[[], bytes]):
+    def _gui_rekey_common(self, make_new_master_key_fn: Callable[[], bytes]):
         self.set_status("Rekeying...")
         self.root.ids.rekey_progress.value = 5
-        self.root.ids.rekey_status.text = "Decrypting..."
+        self.root.ids.rekey_status.text = "Preparing..."
 
         def work():
-            with _MODEL_LOCK, _CRYPTO_LOCK:
-                old_key = get_or_create_key()
-                tmp_model = _tmp_path("model_rekey", ".gguf")
-                tmp_db = _tmp_path("db_rekey", ".db")
+            with _MODEL_LOCK:
+                old_master = get_or_create_key()
+                old_mk = _model_key(old_master)
+                old_dk = _db_key(old_master)
+
+                tmp_model_plain = _tmp_path("model_rekey", ".gguf")
+                tmp_db_plain = _tmp_path("db_rekey", ".db")
+
+                new_enc_model_tmp = ENCRYPTED_MODEL.with_suffix(ENCRYPTED_MODEL.suffix + f".rekey.{uuid.uuid4().hex}.tmp")
+                new_db_tmp = DB_PATH.with_suffix(DB_PATH.suffix + f".rekey.{uuid.uuid4().hex}.tmp")
+
                 try:
+                    self._rekey_ui(10, "Decrypting...")
+
                     if ENCRYPTED_MODEL.exists():
-                        decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
+                        decrypt_file(ENCRYPTED_MODEL, tmp_model_plain, old_mk)
 
                     if DB_PATH.exists():
-                        pt = aes_decrypt(DB_PATH.read_bytes(), old_key)
-                        _atomic_write_bytes(tmp_db, pt)
+                        with _CRYPTO_LOCK:
+                            pt = aes_decrypt(DB_PATH.read_bytes(), old_dk)
+                            _atomic_write_bytes(tmp_db_plain, pt)
 
-                    new_key = make_new_key_fn()
-                    Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 55), 0)
+                    self._rekey_ui(45, "Generating new key...")
 
-                    if tmp_model.exists():
-                        encrypt_file(tmp_model, ENCRYPTED_MODEL, new_key)
+                    new_master = make_new_master_key_fn()
+                    new_mk = _model_key(new_master)
+                    new_dk = _db_key(new_master)
 
-                    Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 80), 0)
+                    self._rekey_ui(60, "Re-encrypting...")
 
-                    if tmp_db.exists():
-                        encdb = aes_encrypt(tmp_db.read_bytes(), new_key)
-                        _atomic_write_bytes(DB_PATH, encdb)
+                    if tmp_model_plain.exists():
+                        encrypt_file(tmp_model_plain, new_enc_model_tmp, new_mk)
+
+                    if tmp_db_plain.exists():
+                        with _CRYPTO_LOCK:
+                            encdb = aes_encrypt(tmp_db_plain.read_bytes(), new_dk)
+                        _atomic_write_bytes(new_db_tmp, encdb)
+
+                    self._rekey_ui(85, "Committing...")
+
+                    if new_enc_model_tmp.exists():
+                        new_enc_model_tmp.replace(ENCRYPTED_MODEL)
+                    if new_db_tmp.exists():
+                        new_db_tmp.replace(DB_PATH)
+
+                    with _CRYPTO_LOCK:
+                        _store_wrapped_key(new_master)
 
                     return True
                 finally:
-                    try:
-                        tmp_model.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    try:
-                        tmp_db.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    for p in [tmp_model_plain, tmp_db_plain, new_enc_model_tmp, new_db_tmp]:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    _cleanup_tmp_dir()
 
         def done(_):
             self.set_status("")
@@ -1878,13 +1951,18 @@ class SecureLLMApp(MDApp):
 
         self._run_bg(work, done, err)
 
-    def gui_rekey_random(self):
-        def make_new_key():
-            new_key = AESGCM.generate_key(256)
-            _store_wrapped_key(new_key)
-            return new_key
+    def _rekey_ui(self, pct: int, text: str):
+        try:
+            Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", int(pct)), 0)
+            Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_status, "text", str(text)), 0)
+        except Exception:
+            pass
 
-        self._gui_rekey_common(make_new_key)
+    def gui_rekey_random(self):
+        def make_new_master():
+            return AESGCM.generate_key(256)
+
+        self._gui_rekey_common(make_new_master)
 
     def gui_rekey_passphrase_dialog(self):
         box = MDBoxLayout(orientation="vertical", spacing="12dp", padding="12dp", adaptive_height=True)
@@ -1913,14 +1991,12 @@ class SecureLLMApp(MDApp):
         dlg.dismiss()
         pw = pw1.strip()
 
-        def make_new_key():
+        def make_new_master():
             _salt, derived = derive_key_from_passphrase(pw)
-            _store_wrapped_key(derived)
             return derived
 
-        self._gui_rekey_common(make_new_key)
+        self._gui_rekey_common(make_new_master)
 
-    # ---- Debug ----
     def gui_debug_refresh(self):
         try:
             meta = f"lines={len(_RING.text().splitlines())} | file={'YES' if LOG_PATH.exists() else 'no'} | path={str(LOG_PATH)}"
@@ -1949,4 +2025,3 @@ class SecureLLMApp(MDApp):
 
 if __name__ == "__main__":
     SecureLLMApp().run()
-

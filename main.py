@@ -1,5 +1,11 @@
+# Single-file app (chat UI + chat-to-model removed)
+# Keeps: Road Risk Scanner, Model Manager, History, Security, Debug
+# Notes:
+# - DB is AESGCM(nonce+ciphertext) bytes (consistent)
+# - llama_cpp is lazy-imported (avoids native import crash at splash)
+# - Rekey flow handles DB with aes_decrypt/aes_encrypt (not decrypt_file)
 
-import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, tempfile, traceback, logging
+import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Callable, Dict
@@ -19,11 +25,6 @@ except Exception:
     cast = None
 
 try:
-    from llama_cpp import Llama
-except Exception:
-    Llama = None
-
-try:
     import psutil
 except Exception:
     psutil = None
@@ -39,6 +40,7 @@ from kivy.lang import Builder
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.uix.widget import Widget
+from kivy.uix.screenmanager import ScreenManager
 from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
@@ -47,51 +49,101 @@ from kivy.utils import platform as _kivy_platform
 
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
-from kivymd.uix.button import MDFlatButton
+from kivymd.uix.button import MDFlatButton, MDRaisedButton
 from kivymd.uix.list import TwoLineListItem, MDList
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.progressbar import MDProgressBar
+from kivymd.uix.toolbar import MDTopAppBar
+from kivymd.uix.label import MDLabel
+from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
+from kivymd.uix.screen import MDScreen
 
 if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 760)
 
+_CRYPTO_LOCK = RLock()
+_MODEL_LOCK = RLock()
+_LOG_LOCK = RLock()
+
+_MODEL_USERS = 0
+_ANDROID_KEY_ALIAS = "qroadscan_master_rsa_v1"
+
+
+def _is_writable_dir(p: Path) -> bool:
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        t = p / f".writetest.{uuid.uuid4().hex}"
+        t.write_text("ok", encoding="utf-8")
+        t.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _android_files_dir() -> Optional[Path]:
+    if _kivy_platform != "android" or autoclass is None:
+        return None
+    try:
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        activity = PythonActivity.mActivity
+        d = activity.getFilesDir().getAbsolutePath()
+        return Path(str(d))
+    except Exception:
+        return None
+
+
 def _app_base_dir() -> Path:
-    p = os.environ.get("ANDROID_PRIVATE") or os.environ.get("ANDROID_APP_PATH")
+    p = os.environ.get("ANDROID_PRIVATE")
     if p:
         base = Path(p)
-    else:
-        base = Path(__file__).resolve().parent
+        d = base / "qroadscan_data"
+        if _is_writable_dir(d):
+            return d
+
+    p2 = os.environ.get("ANDROID_APP_PATH")
+    if p2:
+        base = Path(p2)
+        d = base / "qroadscan_data"
+        if _is_writable_dir(d):
+            return d
+
+    af = _android_files_dir()
+    if af:
+        d = af / "qroadscan_data"
+        if _is_writable_dir(d):
+            return d
+
+    base = Path(__file__).resolve().parent
     d = base / "qroadscan_data"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+
 BASE_DIR = _app_base_dir()
+
 MODEL_REPO = "https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/"
 MODEL_FILE = "llama3-small-Q3_K_M.gguf"
+EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
+
 MODELS_DIR = (BASE_DIR / "models")
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
-DB_PATH = (BASE_DIR / "chat_history.db.aes")
+
+DB_PATH = (BASE_DIR / "chat_history.db.aes")  # AESGCM(nonce+ciphertext) bytes
 KEY_PATH = (BASE_DIR / ".enc_key_wrapped")
 LOG_PATH = (BASE_DIR / "debug.log")
 TMP_DIR = (BASE_DIR / "tmp")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
-EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-_CRYPTO_LOCK = RLock()
-_MODEL_LOCK = RLock()
-_MODEL_USERS = 0
-
-_ANDROID_KEY_ALIAS = "qroadscan_master_rsa_v1"
-_LOG_LOCK = RLock()
 
 class _RingLog:
     def __init__(self, max_lines=600):
         self.max_lines = int(max_lines)
         self._lines = []
         self._lock = RLock()
+
     def add(self, line: str):
         line = (line or "").rstrip("\n")
         if not line:
@@ -99,26 +151,33 @@ class _RingLog:
         with self._lock:
             self._lines.append(line)
             if len(self._lines) > self.max_lines:
-                self._lines = self._lines[-self.max_lines:]
+                self._lines = self._lines[-self.max_lines :]
+
     def text(self) -> str:
         with self._lock:
             return "\n".join(self._lines)
+
     def clear(self):
         with self._lock:
             self._lines = []
 
+
 _RING = _RingLog()
+
 
 class _FileAndRingHandler(logging.Handler):
     def __init__(self):
         super().__init__()
         self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
     def emit(self, record):
         try:
             msg = self._fmt.format(record)
         except Exception:
             msg = str(record.getMessage())
+
         _RING.add(msg)
+
         try:
             with _LOG_LOCK:
                 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +185,7 @@ class _FileAndRingHandler(logging.Handler):
                     f.write(msg + "\n")
         except Exception:
             pass
+
         try:
             app = MDApp.get_running_app()
             if app and hasattr(app, "_debug_dirty"):
@@ -133,10 +193,12 @@ class _FileAndRingHandler(logging.Handler):
         except Exception:
             pass
 
+
 logger = logging.getLogger("qroadscan")
 logger.setLevel(logging.INFO)
 if not any(isinstance(h, _FileAndRingHandler) for h in logger.handlers):
     logger.addHandler(_FileAndRingHandler())
+
 
 def _atomic_write_bytes(path: Path, data: bytes):
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
@@ -144,18 +206,24 @@ def _atomic_write_bytes(path: Path, data: bytes):
     tmp.write_bytes(data)
     tmp.replace(path)
 
+
 def _tmp_path(prefix: str, suffix: str) -> Path:
     return TMP_DIR / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
+
 
 def aes_encrypt(data: bytes, key: bytes) -> bytes:
     aes = AESGCM(key)
     nonce = os.urandom(12)
     return nonce + aes.encrypt(nonce, data, None)
 
+
 def aes_decrypt(data: bytes, key: bytes) -> bytes:
+    if not data or len(data) < 12:
+        raise InvalidTag("ciphertext too short")
     aes = AESGCM(key)
     nonce, ct = data[:12], data[12:]
     return aes.decrypt(nonce, ct, None)
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -164,14 +232,17 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def _android_ready() -> bool:
     return _kivy_platform == "android" and autoclass is not None and cast is not None
+
 
 def _android_keystore_get():
     KeyStore = autoclass("java.security.KeyStore")
     ks = KeyStore.getInstance("AndroidKeyStore")
     ks.load(None)
     return ks
+
 
 def _android_keystore_ensure_rsa(alias: str):
     ks = _android_keystore_get()
@@ -189,6 +260,7 @@ def _android_keystore_ensure_rsa(alias: str):
     kpg.initialize(spec)
     kpg.generateKeyPair()
 
+
 def _android_keystore_wrap_key(aes_key: bytes) -> bytes:
     _android_keystore_ensure_rsa(_ANDROID_KEY_ALIAS)
     ks = _android_keystore_get()
@@ -198,6 +270,7 @@ def _android_keystore_wrap_key(aes_key: bytes) -> bytes:
     cipher = CipherJ.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
     cipher.init(CipherJ.ENCRYPT_MODE, pub)
     return bytes(cipher.doFinal(aes_key))
+
 
 def _android_keystore_unwrap_key(wrapped: bytes) -> bytes:
     _android_keystore_ensure_rsa(_ANDROID_KEY_ALIAS)
@@ -209,6 +282,7 @@ def _android_keystore_unwrap_key(wrapped: bytes) -> bytes:
     cipher.init(CipherJ.DECRYPT_MODE, priv)
     return bytes(cipher.doFinal(wrapped))
 
+
 def _store_wrapped_key(raw_key: bytes):
     if _android_ready():
         wrapped = _android_keystore_wrap_key(raw_key)
@@ -217,6 +291,7 @@ def _store_wrapped_key(raw_key: bytes):
     else:
         _atomic_write_bytes(KEY_PATH, raw_key)
         logger.info("key stored: file raw (non-android)")
+
 
 def _load_wrapped_key() -> Optional[bytes]:
     if not KEY_PATH.exists():
@@ -237,6 +312,7 @@ def _load_wrapped_key() -> Optional[bytes]:
         logger.info("key loaded: file raw (non-android)")
     return k
 
+
 def get_or_create_key() -> bytes:
     with _CRYPTO_LOCK:
         k = _load_wrapped_key()
@@ -250,6 +326,7 @@ def get_or_create_key() -> bytes:
             logger.exception("key store failed, fell back to raw file write")
         return key
 
+
 def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
     if salt is None:
         salt = os.urandom(16)
@@ -257,7 +334,13 @@ def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[b
     derived = kdf_der.derive(pw.encode("utf-8"))
     return salt, derived
 
-def download_model_httpx_with_cb(url: str, dest: Path, progress_cb: Optional[Callable[[int, int], None]] = None, timeout=None) -> str:
+
+def download_model_httpx_with_cb(
+    url: str,
+    dest: Path,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    timeout=None,
+) -> str:
     dest.parent.mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
     with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as r:
@@ -283,6 +366,7 @@ def download_model_httpx_with_cb(url: str, dest: Path, progress_cb: Optional[Cal
                 pass
     return h.hexdigest()
 
+
 def encrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 1024):
     with _CRYPTO_LOCK:
         nonce = os.urandom(12)
@@ -298,6 +382,7 @@ def encrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 102
             enc.finalize()
             fout.write(enc.tag)
         tmp.replace(dest)
+
 
 def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 1024):
     with _CRYPTO_LOCK:
@@ -325,14 +410,17 @@ def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 102
                 dec.finalize()
             tmp.replace(dest)
 
+
 async def init_db(key: bytes):
     with _CRYPTO_LOCK:
         if DB_PATH.exists():
             return
-        tmp_plain = _tmp_path("chat_init", ".db")
+        tmp_plain = _tmp_path("hist_init", ".db")
         try:
             async with aiosqlite.connect(str(tmp_plain)) as db:
-                await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)")
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)"
+                )
                 await db.commit()
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
@@ -342,6 +430,7 @@ async def init_db(key: bytes):
                 tmp_plain.unlink(missing_ok=True)
             except Exception:
                 pass
+
 
 def _mark_corrupt(path: Path):
     try:
@@ -354,11 +443,13 @@ def _mark_corrupt(path: Path):
         except Exception:
             pass
 
+
 def _safe_decrypt_db_to(tmp_plain: Path, key: bytes) -> bool:
     if not DB_PATH.exists():
         return False
     try:
-        decrypt_file(DB_PATH, tmp_plain, key)
+        pt = aes_decrypt(DB_PATH.read_bytes(), key)
+        _atomic_write_bytes(tmp_plain, pt)
         return True
     except InvalidTag:
         logger.warning("db decrypt invalid tag, marked corrupt")
@@ -368,22 +459,26 @@ def _safe_decrypt_db_to(tmp_plain: Path, key: bytes) -> bool:
         logger.exception("db decrypt failed")
         return False
 
+
 async def log_interaction(prompt: str, response: str, key: bytes):
     with _CRYPTO_LOCK:
         if not DB_PATH.exists():
             await init_db(key)
-        tmp_plain = _tmp_path("chat_work", ".db")
+
+        tmp_plain = _tmp_path("hist_work", ".db")
         try:
             if not _safe_decrypt_db_to(tmp_plain, key):
                 await init_db(key)
                 if not _safe_decrypt_db_to(tmp_plain, key):
                     return
+
             async with aiosqlite.connect(str(tmp_plain)) as db:
                 await db.execute(
                     "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
                     (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
                 )
                 await db.commit()
+
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
         finally:
@@ -392,17 +487,20 @@ async def log_interaction(prompt: str, response: str, key: bytes):
             except Exception:
                 pass
 
+
 async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Optional[str] = None):
     with _CRYPTO_LOCK:
         if not DB_PATH.exists():
             await init_db(key)
-        tmp_plain = _tmp_path("chat_read", ".db")
+
+        tmp_plain = _tmp_path("hist_read", ".db")
         rows = []
         try:
             if not _safe_decrypt_db_to(tmp_plain, key):
                 await init_db(key)
                 if not _safe_decrypt_db_to(tmp_plain, key):
                     return []
+
             async with aiosqlite.connect(str(tmp_plain)) as db:
                 if search:
                     q = f"%{search}%"
@@ -419,6 +517,7 @@ async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Op
                     ) as cur:
                         async for r in cur:
                             rows.append(r)
+
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
         finally:
@@ -426,12 +525,24 @@ async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Op
                 tmp_plain.unlink(missing_ok=True)
             except Exception:
                 pass
+
         return rows
 
+
+# ---- llama_cpp lazy import ----
+def _get_llama_class():
+    from llama_cpp import Llama  # noqa
+    return Llama
+
+
 def load_llama_model_blocking(model_path: Path):
-    if Llama is None:
-        raise RuntimeError("llama_cpp import failed on this device/build")
-    return Llama(model_path=str(model_path), n_ctx=2048, n_threads=max(2, (os.cpu_count() or 4) // 2))
+    Llama = _get_llama_class()
+    return Llama(
+        model_path=str(model_path),
+        n_ctx=2048,
+        n_threads=max(2, (os.cpu_count() or 4) // 2),
+    )
+
 
 def _read_proc_stat():
     try:
@@ -446,6 +557,7 @@ def _read_proc_stat():
         return total, idle
     except Exception:
         return None
+
 
 def _cpu_percent_from_proc(sample_interval=0.12):
     t1 = _read_proc_stat()
@@ -463,6 +575,7 @@ def _cpu_percent_from_proc(sample_interval=0.12):
         return None
     usage = (total_delta - idle_delta) / float(total_delta)
     return max(0.0, min(1.0, usage))
+
 
 def _mem_from_proc():
     try:
@@ -486,6 +599,7 @@ def _mem_from_proc():
     except Exception:
         return None
 
+
 def _load1_from_proc(cpu_count_fallback=1):
     try:
         with open("/proc/loadavg", "r") as f:
@@ -500,12 +614,14 @@ def _load1_from_proc(cpu_count_fallback=1):
     except Exception:
         return None
 
+
 def _proc_count_from_proc():
     try:
         pids = [name for name in os.listdir("/proc") if name.isdigit()]
         return max(0.0, min(1.0, len(pids) / 1000.0))
     except Exception:
         return None
+
 
 def _read_temperature():
     temps = []
@@ -534,8 +650,10 @@ def _read_temperature():
     except Exception:
         return None
 
+
 def collect_system_metrics() -> Dict[str, float]:
     cpu = mem = load1 = temp = proc = None
+
     if psutil is not None:
         try:
             cpu = psutil.cpu_percent(interval=0.1) / 100.0
@@ -561,6 +679,7 @@ def collect_system_metrics() -> Dict[str, float]:
                 proc = None
         except Exception:
             cpu = mem = load1 = temp = proc = None
+
     if cpu is None:
         cpu = _cpu_percent_from_proc()
     if mem is None:
@@ -571,6 +690,7 @@ def collect_system_metrics() -> Dict[str, float]:
         proc = _proc_count_from_proc()
     if temp is None:
         temp = _read_temperature()
+
     cpu = float(max(0.0, min(1.0, float(cpu or 0.0))))
     mem = float(max(0.0, min(1.0, float(mem or 0.0))))
     load1 = float(max(0.0, min(1.0, float(load1 or 0.0))))
@@ -578,18 +698,22 @@ def collect_system_metrics() -> Dict[str, float]:
     temp = float(max(0.0, min(1.0, float(temp or 0.0))))
     return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
 
+
 def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
     cpu = metrics.get("cpu", 0.1)
     mem = metrics.get("mem", 0.1)
     temp = metrics.get("temp", 0.1)
     load1 = metrics.get("load1", 0.0)
     proc = metrics.get("proc", 0.0)
+
     r = cpu * (1.0 + load1)
     g = mem * (1.0 + proc)
     b = temp * (0.5 + cpu * 0.5)
+
     maxi = max(r, g, b, 1.0)
     r, g, b = r / maxi, g / maxi, b / maxi
     return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
+
 
 def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
     if qml is None or pnp is None:
@@ -599,7 +723,9 @@ def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) 
         base = (0.3 * r + 0.4 * g + 0.3 * b)
         noise = (random.random() - 0.5) * 0.08
         return max(0.0, min(1.0, base + noise))
+
     dev = qml.device("default.qubit", wires=2, shots=shots)
+
     @qml.qnode(dev)
     def circuit(a, b, c):
         qml.RX(a * math.pi, wires=0)
@@ -609,6 +735,7 @@ def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) 
         qml.RX((a + b) * math.pi / 2, wires=0)
         qml.RY((b + c) * math.pi / 2, wires=1)
         return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))
+
     a, b, c = float(rgb[0]), float(rgb[1]), float(rgb[2])
     try:
         ev0, ev1 = circuit(a, b, c)
@@ -617,6 +744,7 @@ def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) 
         return float(max(0.0, min(1.0, score)))
     except Exception:
         return float(0.5 * (a + b + c) / 3.0)
+
 
 def entropic_summary_text(score: float) -> str:
     if score >= 0.75:
@@ -627,24 +755,40 @@ def entropic_summary_text(score: float) -> str:
         level = "low"
     return f"entropic_score={score:.3f} (level={level})"
 
+
 def _simple_tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
+
 
 def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
     toks = _simple_tokenize(prompt_text)
     freq = {}
     for t in toks:
         freq[t] = freq.get(t, 0) + 1
-    hazard_boost = {"ice": 2.0, "wet": 1.8, "snow": 2.0, "flood": 2.0, "construction": 1.8, "pedestrian": 1.8, "debris": 1.8, "animal": 1.5, "stall": 1.4, "fog": 1.6}
+
+    hazard_boost = {
+        "ice": 2.0,
+        "wet": 1.8,
+        "snow": 2.0,
+        "flood": 2.0,
+        "construction": 1.8,
+        "pedestrian": 1.8,
+        "debris": 1.8,
+        "animal": 1.5,
+        "stall": 1.4,
+        "fog": 1.6,
+    }
     scored = {}
     for t, c in freq.items():
         boost = hazard_boost.get(t, 1.0)
         scored[t] = c * boost
+
     items = sorted(scored.items(), key=lambda x: -x[1])[:top_n]
     if not items:
         return {}
     maxv = items[0][1]
     return {k: float(v / maxv) for k, v in items}
+
 
 def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str = "balanced") -> Tuple[str, float]:
     if not token_weights:
@@ -659,16 +803,28 @@ def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str 
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
     return patched, multiplier
 
-def chunked_generate(llm, prompt: str, max_total_tokens: int = 256, chunk_tokens: int = 64, base_temperature: float = 0.2, punkd_profile: str = "balanced", streaming_callback: Optional[Callable[[str], None]] = None) -> str:
+
+def chunked_generate(
+    llm,
+    prompt: str,
+    max_total_tokens: int = 256,
+    chunk_tokens: int = 64,
+    base_temperature: float = 0.2,
+    punkd_profile: str = "balanced",
+    streaming_callback: Optional[Callable[[str], None]] = None,
+) -> str:
     assembled = ""
     cur_prompt = prompt
     token_weights = punkd_analyze(prompt, top_n=16)
     iterations = max(1, (max_total_tokens + chunk_tokens - 1) // chunk_tokens)
     prev_tail = ""
+
     for _ in range(iterations):
         patched_prompt, mult = punkd_apply(cur_prompt, token_weights, profile=punkd_profile)
         temp = max(0.01, min(2.0, base_temperature * mult))
+
         out = llm(patched_prompt, max_tokens=chunk_tokens, temperature=temp)
+
         text = ""
         if isinstance(out, dict):
             try:
@@ -680,26 +836,34 @@ def chunked_generate(llm, prompt: str, max_total_tokens: int = 256, chunk_tokens
                 text = str(out)
             except Exception:
                 text = ""
+
         text = (text or "").strip()
         if not text:
             break
+
         overlap = 0
         max_ol = min(30, len(prev_tail), len(text))
         for olen in range(max_ol, 0, -1):
             if prev_tail.endswith(text[:olen]):
                 overlap = olen
                 break
+
         append_text = text[overlap:] if overlap else text
         assembled += append_text
         prev_tail = assembled[-120:] if len(assembled) > 120 else assembled
+
         if streaming_callback:
             streaming_callback(append_text)
+
         if assembled.strip().endswith(("Low", "Medium", "High")):
             break
         if len(text.split()) < max(4, chunk_tokens // 8):
             break
+
         cur_prompt = prompt + "\n\nAssistant so far:\n" + assembled + "\n\nContinue:"
+
     return assembled.strip()
+
 
 def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -> str:
     entropy_text = "entropic_score=unknown"
@@ -717,6 +881,7 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
         )
     else:
         metrics_line = "sys_metrics: disabled"
+
     return (
         "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
         "Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
@@ -751,6 +916,7 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
         "[/replytemplate]"
     )
 
+
 async def mobile_ensure_init() -> bytes:
     key = get_or_create_key()
     try:
@@ -758,6 +924,7 @@ async def mobile_ensure_init() -> bytes:
     except Exception:
         logger.exception("init db failed")
     return key
+
 
 @contextmanager
 def acquire_plain_model(key: bytes):
@@ -769,6 +936,7 @@ def acquire_plain_model(key: bytes):
         if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
             raise FileNotFoundError("Model not found")
         _MODEL_USERS += 1
+
     try:
         yield MODEL_PATH
     finally:
@@ -782,46 +950,11 @@ def acquire_plain_model(key: bytes):
                 except Exception:
                     logger.exception("model re-encrypt failed")
 
-async def mobile_run_chat(prompt: str) -> str:
-    key = await mobile_ensure_init()
-    try:
-        with acquire_plain_model(key) as model_path:
-            loop = asyncio.get_running_loop()
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                try:
-                    llm = await loop.run_in_executor(ex, load_llama_model_blocking, model_path)
-                except Exception as e:
-                    logger.exception("model load failed")
-                    return f"[Error loading model: {e}]"
-                def gen(p):
-                    out = llm(p, max_tokens=256, temperature=0.7)
-                    text = ""
-                    if isinstance(out, dict):
-                        try:
-                            text = out.get("choices", [{"text": ""}])[0].get("text", "")
-                        except Exception:
-                            text = out.get("text", "")
-                    else:
-                        text = str(out)
-                    text = (text or "").strip()
-                    text = text.replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "").strip()
-                    return text
-                result = await loop.run_in_executor(ex, gen, prompt)
-                try:
-                    await log_interaction(prompt, result, key)
-                except Exception:
-                    logger.exception("log interaction failed")
-                try:
-                    del llm
-                except Exception:
-                    pass
-                return result
-    except FileNotFoundError:
-        return "[Model not found. Place or download the GGUF model on device.]"
 
 async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
     key = await mobile_ensure_init()
     prompt = build_road_scanner_prompt(data, include_system_entropy=True)
+
     try:
         with acquire_plain_model(key) as model_path:
             loop = asyncio.get_running_loop()
@@ -831,12 +964,23 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                 except Exception as e:
                     logger.exception("model load failed")
                     return "[Error]", f"[Error loading model: {e}]"
+
                 def run_chunked():
-                    return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile="balanced", streaming_callback=None)
+                    return chunked_generate(
+                        llm=llm,
+                        prompt=prompt,
+                        max_total_tokens=256,
+                        chunk_tokens=64,
+                        base_temperature=0.18,
+                        punkd_profile="balanced",
+                        streaming_callback=None,
+                    )
+
                 result = await loop.run_in_executor(ex, run_chunked)
                 text = (result or "").strip().replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "")
                 candidate = text.split()
                 label = candidate[0].capitalize() if candidate else ""
+
                 if label not in ("Low", "Medium", "High"):
                     lowered = text.lower()
                     if "low" in lowered:
@@ -847,27 +991,34 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                         label = "High"
                     else:
                         label = "Medium"
+
                 try:
                     await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
                 except Exception:
                     logger.exception("log interaction failed")
+
                 try:
                     del llm
                 except Exception:
                     pass
+
                 return label, text
     except FileNotFoundError:
         return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]"
+
 
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.07, 0.09, 0.14, 1])
     bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
     steps = NumericProperty(44)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
+
     def _lerp(self, a, b, t):
         return a + (b - a) * t
+
     def _redraw(self, *args):
         self.canvas.before.clear()
         x, y = self.pos
@@ -883,6 +1034,7 @@ class BackgroundGradient(Widget):
                 Color(r, g, b, a)
                 Rectangle(pos=(x, y + (h * i / n)), size=(w, h / n + 1))
 
+
 class GlassCard(Widget):
     radius = NumericProperty(dp(26))
     fill = ListProperty([1, 1, 1, 0.055])
@@ -890,10 +1042,21 @@ class GlassCard(Widget):
     highlight = ListProperty([1, 1, 1, 0.08])
     _shine_x = NumericProperty(0.0)
     _shine_alpha = NumericProperty(0.0)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.bind(pos=self._redraw, size=self._redraw, radius=self._redraw, fill=self._redraw, border=self._redraw, highlight=self._redraw, _shine_x=self._redraw, _shine_alpha=self._redraw)
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            radius=self._redraw,
+            fill=self._redraw,
+            border=self._redraw,
+            highlight=self._redraw,
+            _shine_x=self._redraw,
+            _shine_alpha=self._redraw,
+        )
         Clock.schedule_once(lambda dt: self._start_shine(), 0.2)
+
     def _start_shine(self):
         self._shine_x = -0.3
         self._shine_alpha = 0.0
@@ -902,6 +1065,7 @@ class GlassCard(Widget):
         loop = (anim + anim2)
         loop.repeat = True
         loop.start(self)
+
     def _redraw(self, *args):
         self.canvas.clear()
         x, y = self.pos
@@ -921,15 +1085,18 @@ class GlassCard(Widget):
                 Color(1, 1, 1, float(self._shine_alpha))
                 Rectangle(pos=(sx, y), size=(w * 0.18, h))
 
+
 class RiskWheelNeo(Widget):
     value = NumericProperty(0.5)
     level = StringProperty("MEDIUM")
     sweep = NumericProperty(0.0)
     glow = NumericProperty(0.25)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, sweep=self._redraw, glow=self._redraw, level=self._redraw)
         Clock.schedule_once(lambda dt: self._start_sweep(), 0.05)
+
     def _start_sweep(self):
         a = Animation(sweep=1.0, duration=2.2, t="linear")
         a.repeat = True
@@ -937,6 +1104,7 @@ class RiskWheelNeo(Widget):
         anim = Animation(glow=0.42, duration=0.9, t="in_out_quad") + Animation(glow=0.22, duration=0.9, t="in_out_quad")
         anim.repeat = True
         anim.start(self)
+
     def set_level(self, level: str):
         lvl = (level or "").strip().upper()
         if lvl.startswith("LOW"):
@@ -950,12 +1118,14 @@ class RiskWheelNeo(Widget):
             self.level = "MEDIUM"
         Animation.cancel_all(self, "value")
         Animation(value=target, duration=0.55, t="out_cubic").start(self)
+
     def _level_color(self):
         if self.level == "LOW":
             return (0.10, 0.90, 0.42)
         if self.level == "HIGH":
             return (0.98, 0.22, 0.30)
         return (0.98, 0.78, 0.20)
+
     def _redraw(self, *args):
         self.canvas.clear()
         cx, cy = self.center
@@ -968,9 +1138,9 @@ class RiskWheelNeo(Widget):
         active_rgb = self._level_color()
         pulse = float(self.glow)
         segs = [
-            ("LOW",  (0.10, 0.85, 0.40), -135.0, -45.0),
-            ("MED",  (0.98, 0.78, 0.20),  -45.0,  45.0),
-            ("HIGH", (0.98, 0.22, 0.30),   45.0, 135.0),
+            ("LOW", (0.10, 0.85, 0.40), -135.0, -45.0),
+            ("MED", (0.98, 0.78, 0.20), -45.0, 45.0),
+            ("HIGH", (0.98, 0.22, 0.30), 45.0, 135.0),
         ]
         gap = 6.0
         with self.canvas:
@@ -990,9 +1160,9 @@ class RiskWheelNeo(Widget):
                 Color(rgb[0], rgb[1], rgb[2], 0.78)
                 Line(circle=(cx, cy, r, a0g, a1g), width=thickness, cap="round")
             Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.22 + 0.18 * pulse)
-            Line(circle=(cx, cy, r, sweep_ang - sweep_width/2.0, sweep_ang + sweep_width/2.0), width=thickness + dp(6), cap="round")
+            Line(circle=(cx, cy, r, sweep_ang - sweep_width / 2.0, sweep_ang + sweep_width / 2.0), width=thickness + dp(6), cap="round")
             Color(1, 1, 1, 0.12)
-            Line(circle=(cx, cy, r, sweep_ang - sweep_width/5.0, sweep_ang + sweep_width/5.0), width=thickness - dp(2), cap="round")
+            Line(circle=(cx, cy, r, sweep_ang - sweep_width / 5.0, sweep_ang + sweep_width / 5.0), width=thickness - dp(2), cap="round")
             nx = cx + math.cos(ang_rad) * (r * 0.92)
             ny = cy + math.sin(ang_rad) * (r * 0.92)
             Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.18 + 0.18 * pulse)
@@ -1005,6 +1175,7 @@ class RiskWheelNeo(Widget):
             Line(rounded_rectangle=[cx - dp(18), cy - dp(18), dp(36), dp(36), dp(18)], width=dp(1.0))
             Color(0.06, 0.07, 0.10, 0.9)
             RoundedRectangle(pos=(cx - dp(12), cy - dp(12)), size=(dp(24), dp(24)), radius=[dp(12)])
+
 
 KV = r"""
 <BackgroundGradient>:
@@ -1028,48 +1199,6 @@ MDScreen:
             halign: "center"
         ScreenManager:
             id: screen_manager
-
-            MDScreen:
-                name: "chat"
-                BackgroundGradient:
-                    top_color: 0.06, 0.08, 0.13, 1
-                    bottom_color: 0.02, 0.03, 0.05, 1
-                MDBoxLayout:
-                    orientation: "vertical"
-                    padding: "10dp"
-                    spacing: "10dp"
-                    FloatLayout:
-                        size_hint_y: 1
-                        GlassCard:
-                            pos: self.parent.pos
-                            size: self.parent.size
-                            height: self.parent.height
-                            radius: dp(26)
-                            fill: 1, 1, 1, 0.05
-                            border: 1, 1, 1, 0.12
-                            highlight: 1, 1, 1, 0.07
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            padding: "12dp"
-                            spacing: "10dp"
-                            pos: self.parent.pos
-                            size: self.parent.size
-                            ScrollView:
-                                MDLabel:
-                                    id: chat_history
-                                    text: ""
-                                    markup: True
-                                    size_hint_y: None
-                                    height: self.texture_size[1]
-                            MDTextField:
-                                id: chat_input
-                                hint_text: "Type your message"
-                                multiline: False
-                                on_text_validate: app.on_chat_send()
-                            MDRaisedButton:
-                                text: "Send"
-                                size_hint_x: 1
-                                on_release: app.on_chat_send()
 
             MDScreen:
                 name: "road"
@@ -1243,7 +1372,7 @@ MDScreen:
                             pos: self.parent.pos
                             size: self.parent.size
                             MDLabel:
-                                text: "Chat History"
+                                text: "History"
                                 bold: True
                                 font_style: "H6"
                                 size_hint_y: None
@@ -1397,11 +1526,6 @@ MDScreen:
         MDBottomNavigation:
             panel_color: 0.08,0.09,0.12,1
             MDBottomNavigationItem:
-                name: "nav_chat"
-                text: "Chat"
-                icon: "chat"
-                on_tab_press: app.switch_screen("chat")
-            MDBottomNavigationItem:
                 name: "nav_road"
                 text: "Road"
                 icon: "road-variant"
@@ -1428,21 +1552,26 @@ MDScreen:
                 on_tab_press: app.switch_screen("debug")
 """
 
+
 class SecureLLMApp(MDApp):
-    chat_history_text = ""
     _hist_page = 0
     _hist_per_page = 10
     _hist_search = None
     _debug_dirty = False
 
     def build(self):
-        self.title = "Secure LLM Road Scanner"
+        self.title = "Road Safe Scanner"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Blue"
-        return Builder.load_string(KV)
+        root = Builder.load_string(KV)
+        return root
 
     def on_start(self):
         logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
+        try:
+            self.root.ids.screen_manager.current = "road"
+        except Exception:
+            pass
         Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
         Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
         Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.35)
@@ -1475,39 +1604,10 @@ class SecureLLMApp(MDApp):
                     Clock.schedule_once(lambda dt: err_fn(e), 0)
                 else:
                     Clock.schedule_once(lambda dt: self.set_status(f"[Error] {e}"), 0)
+
         threading.Thread(target=runner, daemon=True).start()
 
-    def append_chat(self, who: str, msg: str):
-        chat_screen = self.root.ids.screen_manager.get_screen("chat")
-        label = chat_screen.ids.chat_history
-        self.chat_history_text += f"[b]{who}>[/b] {msg}\n"
-        label.text = self.chat_history_text
-
-    def on_chat_send(self):
-        chat_screen = self.root.ids.screen_manager.get_screen("chat")
-        field = chat_screen.ids.chat_input
-        prompt = field.text.strip()
-        if not prompt:
-            return
-        field.text = ""
-        self.append_chat("You", prompt)
-        self.set_status("Thinking...")
-        logger.info("chat send len=%d", len(prompt))
-        threading.Thread(target=self._chat_worker, args=(prompt,), daemon=True).start()
-
-    def _chat_worker(self, prompt: str):
-        try:
-            result = asyncio.run(mobile_run_chat(prompt))
-        except Exception as e:
-            logger.exception("chat worker failed")
-            result = f"[Error: {e}]"
-        Clock.schedule_once(lambda dt: self._chat_finish(result), 0)
-
-    def _chat_finish(self, reply: str):
-        self.append_chat("Model", reply)
-        self.set_status("")
-        logger.info("chat reply len=%d", len(reply or ""))
-
+    # ---- Road scan ----
     def on_scan(self):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         data = {
@@ -1541,6 +1641,7 @@ class SecureLLMApp(MDApp):
         self.set_status("")
         logger.info("road scan done label=%s raw_len=%d", label, len(raw or ""))
 
+    # ---- Model manager ----
     def gui_model_refresh(self):
         s = []
         s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
@@ -1558,24 +1659,30 @@ class SecureLLMApp(MDApp):
         self.set_status("Downloading...")
         self.root.ids.model_progress.value = 0
         url = MODEL_REPO + MODEL_FILE
+
         def work():
             get_or_create_key()
+
             def cb(done, total):
                 if total > 0:
                     pct = int(done * 100 / total)
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.model_progress, "value", pct), 0)
+
             sha = download_model_httpx_with_cb(url, MODEL_PATH, progress_cb=cb, timeout=None)
             return sha
+
         def done(sha):
             self.set_status("")
             self.gui_model_refresh()
             ok = (sha.lower() == EXPECTED_HASH.lower())
             self.root.ids.model_status.text = f"Downloaded SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
             logger.info("model downloaded sha=%s match=%s", sha, "YES" if ok else "NO")
+
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Download failed: {e}"
             logger.exception("model download failed")
+
         self._run_bg(work, done, err)
 
     def gui_model_verify(self):
@@ -1583,13 +1690,16 @@ class SecureLLMApp(MDApp):
             self.root.ids.model_status.text = "No plaintext model."
             return
         self.set_status("Hashing...")
+
         def work():
             return sha256_file(MODEL_PATH)
+
         def done(sha):
             self.set_status("")
             ok = (sha.lower() == EXPECTED_HASH.lower())
             self.root.ids.model_status.text = f"Plain SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
             logger.info("model sha verify sha=%s match=%s", sha, "YES" if ok else "NO")
+
         self._run_bg(work, done)
 
     def gui_model_encrypt(self):
@@ -1597,20 +1707,24 @@ class SecureLLMApp(MDApp):
             self.root.ids.model_status.text = "No plaintext model."
             return
         self.set_status("Encrypting...")
+
         def work():
             key = get_or_create_key()
             with _MODEL_LOCK:
                 encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
             return True
+
         def done(_):
             self.set_status("")
             self.gui_model_refresh()
             self.root.ids.model_status.text = "Encrypted model created."
             logger.info("model encrypt ok")
+
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Encrypt failed: {e}"
             logger.exception("model encrypt failed")
+
         self._run_bg(work, done, err)
 
     def gui_model_decrypt(self):
@@ -1618,20 +1732,24 @@ class SecureLLMApp(MDApp):
             self.root.ids.model_status.text = "No encrypted model."
             return
         self.set_status("Decrypting...")
+
         def work():
             key = get_or_create_key()
             with _MODEL_LOCK:
                 decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
             return True
+
         def done(_):
             self.set_status("")
             self.gui_model_refresh()
             self.root.ids.model_status.text = "Plaintext model present."
             logger.info("model decrypt ok")
+
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Decrypt failed: {e}"
             logger.exception("model decrypt failed")
+
         self._run_bg(work, done, err)
 
     def gui_model_delete_plain(self):
@@ -1648,17 +1766,20 @@ class SecureLLMApp(MDApp):
                 self.root.ids.model_status.text = f"Delete failed: {e}"
                 logger.exception("model plaintext delete failed")
 
+    # ---- History ----
     def gui_history_refresh(self):
         self.set_status("Loading history...")
         self.root.ids.history_list.clear_widgets()
         page = self._hist_page
         per_page = self._hist_per_page
         search = self._hist_search
+
         def work():
             key = get_or_create_key()
             asyncio.run(init_db(key))
             rows = asyncio.run(fetch_history(key, limit=per_page, offset=page * per_page, search=search))
             return rows
+
         def done(rows):
             self.set_status("")
             self.root.ids.history_meta.text = f"Page {self._hist_page+1} | search={self._hist_search or '—'} | rows={len(rows)}"
@@ -1673,10 +1794,12 @@ class SecureLLMApp(MDApp):
                         on_release=lambda item, rid=rid, ts=ts, prompt=prompt, resp=resp: self._history_show_dialog(rid, ts, prompt, resp),
                     )
                 )
+
         def err(e):
             self.set_status("")
             self.root.ids.history_meta.text = f"History error: {e}"
             logger.exception("history refresh failed")
+
         self._run_bg(work, done, err)
 
     def _history_show_dialog(self, rid, ts, prompt, resp):
@@ -1705,10 +1828,12 @@ class SecureLLMApp(MDApp):
         self._hist_page = 0
         self.gui_history_refresh()
 
+    # ---- Rekey ----
     def _gui_rekey_common(self, make_new_key_fn: Callable[[], bytes]):
         self.set_status("Rekeying...")
         self.root.ids.rekey_progress.value = 5
         self.root.ids.rekey_status.text = "Decrypting..."
+
         def work():
             with _MODEL_LOCK, _CRYPTO_LOCK:
                 old_key = get_or_create_key()
@@ -1717,16 +1842,23 @@ class SecureLLMApp(MDApp):
                 try:
                     if ENCRYPTED_MODEL.exists():
                         decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
+
                     if DB_PATH.exists():
-                        decrypt_file(DB_PATH, tmp_db, old_key)
+                        pt = aes_decrypt(DB_PATH.read_bytes(), old_key)
+                        _atomic_write_bytes(tmp_db, pt)
+
                     new_key = make_new_key_fn()
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 55), 0)
+
                     if tmp_model.exists():
                         encrypt_file(tmp_model, ENCRYPTED_MODEL, new_key)
+
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 80), 0)
+
                     if tmp_db.exists():
                         encdb = aes_encrypt(tmp_db.read_bytes(), new_key)
                         _atomic_write_bytes(DB_PATH, encdb)
+
                     return True
                 finally:
                     try:
@@ -1737,17 +1869,20 @@ class SecureLLMApp(MDApp):
                         tmp_db.unlink(missing_ok=True)
                     except Exception:
                         pass
+
         def done(_):
             self.set_status("")
             self.root.ids.rekey_progress.value = 100
             self.root.ids.rekey_status.text = "Rekey complete."
             self.gui_model_refresh()
             logger.info("rekey complete")
+
         def err(e):
             self.set_status("")
             self.root.ids.rekey_progress.value = 0
             self.root.ids.rekey_status.text = f"Rekey failed: {e}"
             logger.exception("rekey failed")
+
         self._run_bg(work, done, err)
 
     def gui_rekey_random(self):
@@ -1755,6 +1890,7 @@ class SecureLLMApp(MDApp):
             new_key = AESGCM.generate_key(256)
             _store_wrapped_key(new_key)
             return new_key
+
         self._gui_rekey_common(make_new_key)
 
     def gui_rekey_passphrase_dialog(self):
@@ -1763,6 +1899,7 @@ class SecureLLMApp(MDApp):
         pass2_field = MDTextField(hint_text="Confirm passphrase", password=True)
         box.add_widget(pass_field)
         box.add_widget(pass2_field)
+
         dlg = MDDialog(
             title="Passphrase Rekey",
             type="custom",
@@ -1779,14 +1916,18 @@ class SecureLLMApp(MDApp):
             self.root.ids.rekey_status.text = "Passphrase mismatch or empty."
             logger.warning("pass rekey mismatch/empty")
             return
+
         dlg.dismiss()
         pw = pw1.strip()
+
         def make_new_key():
-            salt, derived = derive_key_from_passphrase(pw)
+            _salt, derived = derive_key_from_passphrase(pw)
             _store_wrapped_key(derived)
             return derived
+
         self._gui_rekey_common(make_new_key)
 
+    # ---- Debug ----
     def gui_debug_refresh(self):
         try:
             meta = f"lines={len(_RING.text().splitlines())} | file={'YES' if LOG_PATH.exists() else 'no'} | path={str(LOG_PATH)}"
@@ -1812,5 +1953,7 @@ class SecureLLMApp(MDApp):
         except Exception:
             logger.exception("debug test exception")
 
+
 if __name__ == "__main__":
     SecureLLMApp().run()
+

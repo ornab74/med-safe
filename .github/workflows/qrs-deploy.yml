@@ -15,7 +15,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}
       KIVY_NO_ARGS: "1"
-      KIVY_HOME: ${{ runner.temp }}/kivy
+      KIVY_HOME: ${{ env.RUNNER_TEMP }}/kivy
       KIVY_NO_CONSOLELOG: "1"
     steps:
       - uses: actions/checkout@v4
@@ -155,8 +155,5 @@ jobs:
 
       - name: Upload DEBUG APK
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: QRS-Android-APK-Debug
-          path: bin/*.apk
-          if-no-files-found: warn
+        uses: actions/upload-arti
+::contentReference[oaicite:0]{index=0}

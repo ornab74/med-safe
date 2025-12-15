@@ -1,19 +1,33 @@
 
-import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, tempfile
+import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, tempfile, traceback, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Callable, Dict
 from contextlib import contextmanager
 from threading import RLock
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from llama_cpp import Llama
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+try:
+    from jnius import autoclass, cast
+except Exception:
+    autoclass = None
+    cast = None
+
+try:
+    from llama_cpp import Llama
+except Exception:
+    Llama = None
 
 try:
     import psutil
 except Exception:
     psutil = None
+
 try:
     import pennylane as qml
     from pennylane import numpy as pnp
@@ -29,23 +43,40 @@ from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
 from kivy.properties import NumericProperty, StringProperty, ListProperty
+from kivy.utils import platform as _kivy_platform
+
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton
-from kivymd.uix.list import TwoLineListItem
+from kivymd.uix.list import TwoLineListItem, MDList
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.progressbar import MDProgressBar
 
-if hasattr(Window, "size"):
+if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 760)
 
+def _app_base_dir() -> Path:
+    p = os.environ.get("ANDROID_PRIVATE") or os.environ.get("ANDROID_APP_PATH")
+    if p:
+        base = Path(p)
+    else:
+        base = Path(__file__).resolve().parent
+    d = base / "qroadscan_data"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+BASE_DIR = _app_base_dir()
 MODEL_REPO = "https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/"
 MODEL_FILE = "llama3-small-Q3_K_M.gguf"
-MODELS_DIR = Path("models")
+MODELS_DIR = (BASE_DIR / "models")
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
-DB_PATH = Path("chat_history.db.aes")
-KEY_PATH = Path(".enc_key")
+DB_PATH = (BASE_DIR / "chat_history.db.aes")
+KEY_PATH = (BASE_DIR / ".enc_key_wrapped")
+LOG_PATH = (BASE_DIR / "debug.log")
+TMP_DIR = (BASE_DIR / "tmp")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -53,14 +84,68 @@ _CRYPTO_LOCK = RLock()
 _MODEL_LOCK = RLock()
 _MODEL_USERS = 0
 
+_ANDROID_KEY_ALIAS = "qroadscan_master_rsa_v1"
+_LOG_LOCK = RLock()
+
+class _RingLog:
+    def __init__(self, max_lines=600):
+        self.max_lines = int(max_lines)
+        self._lines = []
+        self._lock = RLock()
+    def add(self, line: str):
+        line = (line or "").rstrip("\n")
+        if not line:
+            return
+        with self._lock:
+            self._lines.append(line)
+            if len(self._lines) > self.max_lines:
+                self._lines = self._lines[-self.max_lines:]
+    def text(self) -> str:
+        with self._lock:
+            return "\n".join(self._lines)
+    def clear(self):
+        with self._lock:
+            self._lines = []
+
+_RING = _RingLog()
+
+class _FileAndRingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    def emit(self, record):
+        try:
+            msg = self._fmt.format(record)
+        except Exception:
+            msg = str(record.getMessage())
+        _RING.add(msg)
+        try:
+            with _LOG_LOCK:
+                LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+        except Exception:
+            pass
+        try:
+            app = MDApp.get_running_app()
+            if app and hasattr(app, "_debug_dirty"):
+                app._debug_dirty = True
+        except Exception:
+            pass
+
+logger = logging.getLogger("qroadscan")
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, _FileAndRingHandler) for h in logger.handlers):
+    logger.addHandler(_FileAndRingHandler())
+
 def _atomic_write_bytes(path: Path, data: bytes):
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_bytes(data)
     tmp.replace(path)
 
 def _tmp_path(prefix: str, suffix: str) -> Path:
-    base = Path(tempfile.gettempdir()) if tempfile.gettempdir() else Path(".")
-    return base / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
+    return TMP_DIR / f"{prefix}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}{suffix}"
 
 def aes_encrypt(data: bytes, key: bytes) -> bytes:
     aes = AESGCM(key)
@@ -79,15 +164,90 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def _android_ready() -> bool:
+    return _kivy_platform == "android" and autoclass is not None and cast is not None
+
+def _android_keystore_get():
+    KeyStore = autoclass("java.security.KeyStore")
+    ks = KeyStore.getInstance("AndroidKeyStore")
+    ks.load(None)
+    return ks
+
+def _android_keystore_ensure_rsa(alias: str):
+    ks = _android_keystore_get()
+    if ks.containsAlias(alias):
+        return
+    KeyPairGenerator = autoclass("java.security.KeyPairGenerator")
+    KeyProperties = autoclass("android.security.keystore.KeyProperties")
+    KeyGenParameterSpecBuilder = autoclass("android.security.keystore.KeyGenParameterSpec$Builder")
+    purposes = int(KeyProperties.PURPOSE_ENCRYPT) | int(KeyProperties.PURPOSE_DECRYPT)
+    builder = KeyGenParameterSpecBuilder(alias, purposes)
+    builder.setDigests([KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512])
+    builder.setEncryptionPaddings([KeyProperties.ENCRYPTION_PADDING_RSA_OAEP])
+    spec = builder.build()
+    kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore")
+    kpg.initialize(spec)
+    kpg.generateKeyPair()
+
+def _android_keystore_wrap_key(aes_key: bytes) -> bytes:
+    _android_keystore_ensure_rsa(_ANDROID_KEY_ALIAS)
+    ks = _android_keystore_get()
+    cert = ks.getCertificate(_ANDROID_KEY_ALIAS)
+    pub = cert.getPublicKey()
+    CipherJ = autoclass("javax.crypto.Cipher")
+    cipher = CipherJ.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
+    cipher.init(CipherJ.ENCRYPT_MODE, pub)
+    return bytes(cipher.doFinal(aes_key))
+
+def _android_keystore_unwrap_key(wrapped: bytes) -> bytes:
+    _android_keystore_ensure_rsa(_ANDROID_KEY_ALIAS)
+    ks = _android_keystore_get()
+    entry = ks.getEntry(_ANDROID_KEY_ALIAS, None)
+    priv = entry.getPrivateKey()
+    CipherJ = autoclass("javax.crypto.Cipher")
+    cipher = CipherJ.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
+    cipher.init(CipherJ.DECRYPT_MODE, priv)
+    return bytes(cipher.doFinal(wrapped))
+
+def _store_wrapped_key(raw_key: bytes):
+    if _android_ready():
+        wrapped = _android_keystore_wrap_key(raw_key)
+        _atomic_write_bytes(KEY_PATH, wrapped)
+        logger.info("key stored: android keystore wrapped")
+    else:
+        _atomic_write_bytes(KEY_PATH, raw_key)
+        logger.info("key stored: file raw (non-android)")
+
+def _load_wrapped_key() -> Optional[bytes]:
+    if not KEY_PATH.exists():
+        return None
+    d = KEY_PATH.read_bytes()
+    if _android_ready():
+        try:
+            k = _android_keystore_unwrap_key(d)
+            if len(k) == 32:
+                logger.info("key loaded: android keystore unwrapped")
+                return k
+            return None
+        except Exception:
+            logger.exception("key unwrap failed")
+            return None
+    k = d[:32] if len(d) >= 32 else None
+    if k:
+        logger.info("key loaded: file raw (non-android)")
+    return k
+
 def get_or_create_key() -> bytes:
     with _CRYPTO_LOCK:
-        if KEY_PATH.exists():
-            d = KEY_PATH.read_bytes()
-            if len(d) >= 48:
-                return d[16:48]
-            return d[:32]
+        k = _load_wrapped_key()
+        if k and len(k) == 32:
+            return k
         key = AESGCM.generate_key(256)
-        _atomic_write_bytes(KEY_PATH, key)
+        try:
+            _store_wrapped_key(key)
+        except Exception:
+            _atomic_write_bytes(KEY_PATH, key)
+            logger.exception("key store failed, fell back to raw file write")
         return key
 
 def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
@@ -123,19 +283,47 @@ def download_model_httpx_with_cb(url: str, dest: Path, progress_cb: Optional[Cal
                 pass
     return h.hexdigest()
 
-def encrypt_file(src: Path, dest: Path, key: bytes):
+def encrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 1024):
     with _CRYPTO_LOCK:
-        data = src.read_bytes()
-        enc = aes_encrypt(data, key)
-        _atomic_write_bytes(dest, enc)
-
-def decrypt_file(src: Path, dest: Path, key: bytes):
-    with _CRYPTO_LOCK:
-        enc = src.read_bytes()
-        data = aes_decrypt(enc, key)
-        tmp = dest.with_suffix(dest.suffix + f".dec.{uuid.uuid4().hex}")
-        tmp.write_bytes(data)
+        nonce = os.urandom(12)
+        enc = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+        tmp = dest.with_suffix(dest.suffix + f".enc.{uuid.uuid4().hex}")
+        with src.open("rb") as fin, tmp.open("wb") as fout:
+            fout.write(nonce)
+            while True:
+                buf = fin.read(chunk_size)
+                if not buf:
+                    break
+                fout.write(enc.update(buf))
+            enc.finalize()
+            fout.write(enc.tag)
         tmp.replace(dest)
+
+def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 1024):
+    with _CRYPTO_LOCK:
+        with src.open("rb") as fin:
+            nonce = fin.read(12)
+            fin.seek(0, os.SEEK_END)
+            total = fin.tell()
+            if total < 12 + 16:
+                raise InvalidTag("ciphertext too short")
+            tag_pos = total - 16
+            fin.seek(tag_pos)
+            tag = fin.read(16)
+            fin.seek(12)
+            dec = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+            tmp = dest.with_suffix(dest.suffix + f".dec.{uuid.uuid4().hex}")
+            with tmp.open("wb") as fout:
+                remaining = tag_pos - 12
+                while remaining > 0:
+                    n = min(chunk_size, remaining)
+                    buf = fin.read(n)
+                    if not buf:
+                        break
+                    remaining -= len(buf)
+                    fout.write(dec.update(buf))
+                dec.finalize()
+            tmp.replace(dest)
 
 async def init_db(key: bytes):
     with _CRYPTO_LOCK:
@@ -148,11 +336,37 @@ async def init_db(key: bytes):
                 await db.commit()
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
+            logger.info("db init ok")
         finally:
             try:
                 tmp_plain.unlink(missing_ok=True)
             except Exception:
                 pass
+
+def _mark_corrupt(path: Path):
+    try:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dst = path.with_suffix(path.suffix + f".corrupt.{ts}.{uuid.uuid4().hex}")
+        path.replace(dst)
+    except Exception:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+def _safe_decrypt_db_to(tmp_plain: Path, key: bytes) -> bool:
+    if not DB_PATH.exists():
+        return False
+    try:
+        decrypt_file(DB_PATH, tmp_plain, key)
+        return True
+    except InvalidTag:
+        logger.warning("db decrypt invalid tag, marked corrupt")
+        _mark_corrupt(DB_PATH)
+        return False
+    except Exception:
+        logger.exception("db decrypt failed")
+        return False
 
 async def log_interaction(prompt: str, response: str, key: bytes):
     with _CRYPTO_LOCK:
@@ -160,7 +374,10 @@ async def log_interaction(prompt: str, response: str, key: bytes):
             await init_db(key)
         tmp_plain = _tmp_path("chat_work", ".db")
         try:
-            decrypt_file(DB_PATH, tmp_plain, key)
+            if not _safe_decrypt_db_to(tmp_plain, key):
+                await init_db(key)
+                if not _safe_decrypt_db_to(tmp_plain, key):
+                    return
             async with aiosqlite.connect(str(tmp_plain)) as db:
                 await db.execute(
                     "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
@@ -182,7 +399,10 @@ async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Op
         tmp_plain = _tmp_path("chat_read", ".db")
         rows = []
         try:
-            decrypt_file(DB_PATH, tmp_plain, key)
+            if not _safe_decrypt_db_to(tmp_plain, key):
+                await init_db(key)
+                if not _safe_decrypt_db_to(tmp_plain, key):
+                    return []
             async with aiosqlite.connect(str(tmp_plain)) as db:
                 if search:
                     q = f"%{search}%"
@@ -208,7 +428,9 @@ async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Op
                 pass
         return rows
 
-def load_llama_model_blocking(model_path: Path) -> Llama:
+def load_llama_model_blocking(model_path: Path):
+    if Llama is None:
+        raise RuntimeError("llama_cpp import failed on this device/build")
     return Llama(model_path=str(model_path), n_ctx=2048, n_threads=max(2, (os.cpu_count() or 4) // 2))
 
 def _read_proc_stat():
@@ -305,19 +527,6 @@ def _read_temperature():
                 except Exception:
                     continue
         if not temps:
-            possible = ["/sys/devices/virtual/thermal/thermal_zone0/temp", "/sys/class/hwmon/hwmon0/temp1_input"]
-            for p in possible:
-                try:
-                    with open(p, "r") as f:
-                        raw = f.read().strip()
-                    if not raw:
-                        continue
-                    val = int(raw)
-                    c = val / 1000.0 if val > 1000 else float(val)
-                    temps.append(c)
-                except Exception:
-                    continue
-        if not temps:
             return None
         avg_c = sum(temps) / len(temps)
         norm = (avg_c - 20.0) / (90.0 - 20.0)
@@ -362,14 +571,11 @@ def collect_system_metrics() -> Dict[str, float]:
         proc = _proc_count_from_proc()
     if temp is None:
         temp = _read_temperature()
-    core_ok = all(x is not None for x in (cpu, mem, load1, proc))
-    if not core_ok:
-        raise RuntimeError("Unable to obtain core system metrics")
-    cpu = float(max(0.0, min(1.0, cpu)))
-    mem = float(max(0.0, min(1.0, mem)))
-    load1 = float(max(0.0, min(1.0, load1)))
-    proc = float(max(0.0, min(1.0, proc)))
-    temp = float(max(0.0, min(1.0, temp))) if temp is not None else 0.0
+    cpu = float(max(0.0, min(1.0, float(cpu or 0.0))))
+    mem = float(max(0.0, min(1.0, float(mem or 0.0))))
+    load1 = float(max(0.0, min(1.0, float(load1 or 0.0))))
+    proc = float(max(0.0, min(1.0, float(proc or 0.0))))
+    temp = float(max(0.0, min(1.0, float(temp or 0.0))))
     return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
 
 def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
@@ -453,7 +659,7 @@ def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str 
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
     return patched, multiplier
 
-def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk_tokens: int = 64, base_temperature: float = 0.2, punkd_profile: str = "balanced", streaming_callback: Optional[Callable[[str], None]] = None) -> str:
+def chunked_generate(llm, prompt: str, max_total_tokens: int = 256, chunk_tokens: int = 64, base_temperature: float = 0.2, punkd_profile: str = "balanced", streaming_callback: Optional[Callable[[str], None]] = None) -> str:
     assembled = ""
     cur_prompt = prompt
     token_weights = punkd_analyze(prompt, top_n=16)
@@ -468,7 +674,7 @@ def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk
             try:
                 text = out.get("choices", [{"text": ""}])[0].get("text", "")
             except Exception:
-                text = out.get("text", "") if isinstance(out, dict) else ""
+                text = out.get("text", "")
         else:
             try:
                 text = str(out)
@@ -550,7 +756,7 @@ async def mobile_ensure_init() -> bytes:
     try:
         await init_db(key)
     except Exception:
-        pass
+        logger.exception("init db failed")
     return key
 
 @contextmanager
@@ -559,6 +765,7 @@ def acquire_plain_model(key: bytes):
     with _MODEL_LOCK:
         if ENCRYPTED_MODEL.exists() and not MODEL_PATH.exists():
             decrypt_file(ENCRYPTED_MODEL, MODEL_PATH, key)
+            logger.info("model decrypted to plaintext")
         if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
             raise FileNotFoundError("Model not found")
         _MODEL_USERS += 1
@@ -571,8 +778,9 @@ def acquire_plain_model(key: bytes):
                 try:
                     encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
                     MODEL_PATH.unlink(missing_ok=True)
+                    logger.info("model re-encrypted and plaintext deleted")
                 except Exception:
-                    pass
+                    logger.exception("model re-encrypt failed")
 
 async def mobile_run_chat(prompt: str) -> str:
     key = await mobile_ensure_init()
@@ -583,6 +791,7 @@ async def mobile_run_chat(prompt: str) -> str:
                 try:
                     llm = await loop.run_in_executor(ex, load_llama_model_blocking, model_path)
                 except Exception as e:
+                    logger.exception("model load failed")
                     return f"[Error loading model: {e}]"
                 def gen(p):
                     out = llm(p, max_tokens=256, temperature=0.7)
@@ -601,7 +810,7 @@ async def mobile_run_chat(prompt: str) -> str:
                 try:
                     await log_interaction(prompt, result, key)
                 except Exception:
-                    pass
+                    logger.exception("log interaction failed")
                 try:
                     del llm
                 except Exception:
@@ -620,6 +829,7 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                 try:
                     llm = await loop.run_in_executor(ex, load_llama_model_blocking, model_path)
                 except Exception as e:
+                    logger.exception("model load failed")
                     return "[Error]", f"[Error loading model: {e}]"
                 def run_chunked():
                     return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile="balanced", streaming_callback=None)
@@ -640,7 +850,7 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                 try:
                     await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
                 except Exception:
-                    pass
+                    logger.exception("log interaction failed")
                 try:
                     del llm
                 except Exception:
@@ -816,7 +1026,7 @@ MDScreen:
             size_hint_y: None
             height: "24dp"
             halign: "center"
-        MDScreenManager:
+        ScreenManager:
             id: screen_manager
 
             MDScreen:
@@ -912,32 +1122,26 @@ MDScreen:
                                 id: loc_field
                                 hint_text: "Location (e.g., I-95 NB mile 12)"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDTextField:
                                 id: road_type_field
                                 hint_text: "Road type (highway/urban/residential)"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDTextField:
                                 id: weather_field
                                 hint_text: "Weather/visibility"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDTextField:
                                 id: traffic_field
                                 hint_text: "Traffic density (low/med/high)"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDTextField:
                                 id: obstacles_field
                                 hint_text: "Reported obstacles"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDTextField:
                                 id: sensor_notes_field
                                 hint_text: "Sensor notes"
                                 mode: "fill"
-                                fill_color: 1, 1, 1, 0.06
                             MDRaisedButton:
                                 text: "Scan Risk"
                                 size_hint_x: 1
@@ -987,7 +1191,6 @@ MDScreen:
                                 id: model_progress
                                 value: 0
                                 max: 100
-                                type: "determinate"
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
@@ -1053,7 +1256,6 @@ MDScreen:
                                     id: history_search
                                     hint_text: "Search prompt/response"
                                     mode: "fill"
-                                    fill_color: 1, 1, 1, 0.06
                                 MDRaisedButton:
                                     text: "Search"
                                     on_release: app.gui_history_search()
@@ -1130,11 +1332,67 @@ MDScreen:
                                 id: rekey_progress
                                 value: 0
                                 max: 100
-                                type: "determinate"
                             MDLabel:
                                 id: rekey_status
                                 text: "—"
                                 theme_text_color: "Secondary"
+
+            MDScreen:
+                name: "debug"
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Debug Log"
+                                bold: True
+                                font_style: "H6"
+                                size_hint_y: None
+                                height: "32dp"
+                            MDLabel:
+                                id: debug_meta
+                                text: "—"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "22dp"
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Refresh"
+                                    on_release: app.gui_debug_refresh()
+                                MDRaisedButton:
+                                    text: "Clear"
+                                    on_release: app.gui_debug_clear()
+                                MDRaisedButton:
+                                    text: "Emit test"
+                                    on_release: app.gui_debug_emit_test()
+                            ScrollView:
+                                MDLabel:
+                                    id: debug_text
+                                    text: ""
+                                    markup: False
+                                    size_hint_y: None
+                                    height: self.texture_size[1]
 
         MDBottomNavigation:
             panel_color: 0.08,0.09,0.12,1
@@ -1163,6 +1421,11 @@ MDScreen:
                 text: "Security"
                 icon: "shield-lock-outline"
                 on_tab_press: app.switch_screen("security")
+            MDBottomNavigationItem:
+                name: "nav_debug"
+                text: "Debug"
+                icon: "bug-outline"
+                on_tab_press: app.switch_screen("debug")
 """
 
 class SecureLLMApp(MDApp):
@@ -1170,17 +1433,36 @@ class SecureLLMApp(MDApp):
     _hist_page = 0
     _hist_per_page = 10
     _hist_search = None
+    _debug_dirty = False
+
     def build(self):
         self.title = "Secure LLM Road Scanner"
+        self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Blue"
-        root = Builder.load_string(KV)
+        return Builder.load_string(KV)
+
+    def on_start(self):
+        logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
         Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
         Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
-        return root
+        Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.35)
+
+    def _debug_auto_refresh(self):
+        try:
+            if self.root.ids.screen_manager.current == "debug" or self._debug_dirty:
+                self._debug_dirty = False
+                self.gui_debug_refresh()
+        except Exception:
+            pass
+
     def switch_screen(self, name: str):
         self.root.ids.screen_manager.current = name
+        if name == "debug":
+            self.gui_debug_refresh()
+
     def set_status(self, text: str):
         self.root.ids.status_label.text = text
+
     def _run_bg(self, work_fn, done_fn=None, err_fn=None):
         def runner():
             try:
@@ -1188,16 +1470,19 @@ class SecureLLMApp(MDApp):
                 if done_fn:
                     Clock.schedule_once(lambda dt: done_fn(out), 0)
             except Exception as e:
+                logger.exception("bg task failed")
                 if err_fn:
                     Clock.schedule_once(lambda dt: err_fn(e), 0)
                 else:
                     Clock.schedule_once(lambda dt: self.set_status(f"[Error] {e}"), 0)
         threading.Thread(target=runner, daemon=True).start()
+
     def append_chat(self, who: str, msg: str):
         chat_screen = self.root.ids.screen_manager.get_screen("chat")
         label = chat_screen.ids.chat_history
         self.chat_history_text += f"[b]{who}>[/b] {msg}\n"
         label.text = self.chat_history_text
+
     def on_chat_send(self):
         chat_screen = self.root.ids.screen_manager.get_screen("chat")
         field = chat_screen.ids.chat_input
@@ -1207,16 +1492,22 @@ class SecureLLMApp(MDApp):
         field.text = ""
         self.append_chat("You", prompt)
         self.set_status("Thinking...")
+        logger.info("chat send len=%d", len(prompt))
         threading.Thread(target=self._chat_worker, args=(prompt,), daemon=True).start()
+
     def _chat_worker(self, prompt: str):
         try:
             result = asyncio.run(mobile_run_chat(prompt))
         except Exception as e:
+            logger.exception("chat worker failed")
             result = f"[Error: {e}]"
-        Clock.schedule_once(lambda dt: self._chat_finish(result))
+        Clock.schedule_once(lambda dt: self._chat_finish(result), 0)
+
     def _chat_finish(self, reply: str):
         self.append_chat("Model", reply)
         self.set_status("")
+        logger.info("chat reply len=%d", len(reply or ""))
+
     def on_scan(self):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         data = {
@@ -1228,13 +1519,17 @@ class SecureLLMApp(MDApp):
             "sensor_notes": road_screen.ids.sensor_notes_field.text.strip() or "none",
         }
         self.set_status("Scanning road risk...")
+        logger.info("road scan req %s", json.dumps(data, ensure_ascii=False))
         threading.Thread(target=self._scan_worker, args=(data,), daemon=True).start()
+
     def _scan_worker(self, data: dict):
         try:
             label, raw = asyncio.run(mobile_run_road_scan(data))
         except Exception as e:
+            logger.exception("scan worker failed")
             label, raw = "[Error]", f"[Error: {e}]"
-        Clock.schedule_once(lambda dt: self._scan_finish(label, raw))
+        Clock.schedule_once(lambda dt: self._scan_finish(label, raw), 0)
+
     def _scan_finish(self, label: str, raw: str):
         road_screen = self.root.ids.screen_manager.get_screen("road")
         try:
@@ -1244,6 +1539,8 @@ class SecureLLMApp(MDApp):
             pass
         road_screen.ids.scan_result.text = label
         self.set_status("")
+        logger.info("road scan done label=%s raw_len=%d", label, len(raw or ""))
+
     def gui_model_refresh(self):
         s = []
         s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
@@ -1255,6 +1552,8 @@ class SecureLLMApp(MDApp):
             s.append(f"EncMB: {ENCRYPTED_MODEL.stat().st_size/1024/1024:.1f}")
         self.root.ids.model_status.text = " | ".join(s)
         self.root.ids.model_progress.value = 0
+        logger.info("model refresh %s", " | ".join(s))
+
     def gui_model_download(self):
         self.set_status("Downloading...")
         self.root.ids.model_progress.value = 0
@@ -1272,10 +1571,13 @@ class SecureLLMApp(MDApp):
             self.gui_model_refresh()
             ok = (sha.lower() == EXPECTED_HASH.lower())
             self.root.ids.model_status.text = f"Downloaded SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
+            logger.info("model downloaded sha=%s match=%s", sha, "YES" if ok else "NO")
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Download failed: {e}"
+            logger.exception("model download failed")
         self._run_bg(work, done, err)
+
     def gui_model_verify(self):
         if not MODEL_PATH.exists():
             self.root.ids.model_status.text = "No plaintext model."
@@ -1287,7 +1589,9 @@ class SecureLLMApp(MDApp):
             self.set_status("")
             ok = (sha.lower() == EXPECTED_HASH.lower())
             self.root.ids.model_status.text = f"Plain SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
+            logger.info("model sha verify sha=%s match=%s", sha, "YES" if ok else "NO")
         self._run_bg(work, done)
+
     def gui_model_encrypt(self):
         if not MODEL_PATH.exists():
             self.root.ids.model_status.text = "No plaintext model."
@@ -1302,10 +1606,13 @@ class SecureLLMApp(MDApp):
             self.set_status("")
             self.gui_model_refresh()
             self.root.ids.model_status.text = "Encrypted model created."
+            logger.info("model encrypt ok")
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Encrypt failed: {e}"
+            logger.exception("model encrypt failed")
         self._run_bg(work, done, err)
+
     def gui_model_decrypt(self):
         if not ENCRYPTED_MODEL.exists():
             self.root.ids.model_status.text = "No encrypted model."
@@ -1320,10 +1627,13 @@ class SecureLLMApp(MDApp):
             self.set_status("")
             self.gui_model_refresh()
             self.root.ids.model_status.text = "Plaintext model present."
+            logger.info("model decrypt ok")
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Decrypt failed: {e}"
+            logger.exception("model decrypt failed")
         self._run_bg(work, done, err)
+
     def gui_model_delete_plain(self):
         with _MODEL_LOCK:
             if not MODEL_PATH.exists():
@@ -1333,8 +1643,11 @@ class SecureLLMApp(MDApp):
                 MODEL_PATH.unlink()
                 self.gui_model_refresh()
                 self.root.ids.model_status.text = "Plaintext model deleted."
+                logger.info("model plaintext deleted")
             except Exception as e:
                 self.root.ids.model_status.text = f"Delete failed: {e}"
+                logger.exception("model plaintext delete failed")
+
     def gui_history_refresh(self):
         self.set_status("Loading history...")
         self.root.ids.history_list.clear_widgets()
@@ -1363,28 +1676,35 @@ class SecureLLMApp(MDApp):
         def err(e):
             self.set_status("")
             self.root.ids.history_meta.text = f"History error: {e}"
+            logger.exception("history refresh failed")
         self._run_bg(work, done, err)
+
     def _history_show_dialog(self, rid, ts, prompt, resp):
         body = f"[{rid}] {ts}\n\nQ:\n{prompt}\n\nA:\n{resp}"
         dlg = MDDialog(title="History Entry", text=body, buttons=[MDFlatButton(text="Close", on_release=lambda x: dlg.dismiss())])
         dlg.open()
+
     def gui_history_next(self):
         self._hist_page += 1
         self.gui_history_refresh()
+
     def gui_history_prev(self):
         if self._hist_page > 0:
             self._hist_page -= 1
         self.gui_history_refresh()
+
     def gui_history_search(self):
         s = self.root.ids.history_search.text.strip()
         self._hist_search = s or None
         self._hist_page = 0
         self.gui_history_refresh()
+
     def gui_history_clear(self):
         self.root.ids.history_search.text = ""
         self._hist_search = None
         self._hist_page = 0
         self.gui_history_refresh()
+
     def _gui_rekey_common(self, make_new_key_fn: Callable[[], bytes]):
         self.set_status("Rekeying...")
         self.root.ids.rekey_progress.value = 5
@@ -1394,8 +1714,6 @@ class SecureLLMApp(MDApp):
                 old_key = get_or_create_key()
                 tmp_model = _tmp_path("model_rekey", ".gguf")
                 tmp_db = _tmp_path("db_rekey", ".db")
-                wrote_model = False
-                wrote_db = False
                 try:
                     if ENCRYPTED_MODEL.exists():
                         decrypt_file(ENCRYPTED_MODEL, tmp_model, old_key)
@@ -1404,14 +1722,11 @@ class SecureLLMApp(MDApp):
                     new_key = make_new_key_fn()
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 55), 0)
                     if tmp_model.exists():
-                        enc = aes_encrypt(tmp_model.read_bytes(), new_key)
-                        _atomic_write_bytes(ENCRYPTED_MODEL, enc)
-                        wrote_model = True
+                        encrypt_file(tmp_model, ENCRYPTED_MODEL, new_key)
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.rekey_progress, "value", 80), 0)
                     if tmp_db.exists():
                         encdb = aes_encrypt(tmp_db.read_bytes(), new_key)
                         _atomic_write_bytes(DB_PATH, encdb)
-                        wrote_db = True
                     return True
                 finally:
                     try:
@@ -1427,17 +1742,21 @@ class SecureLLMApp(MDApp):
             self.root.ids.rekey_progress.value = 100
             self.root.ids.rekey_status.text = "Rekey complete."
             self.gui_model_refresh()
+            logger.info("rekey complete")
         def err(e):
             self.set_status("")
             self.root.ids.rekey_progress.value = 0
             self.root.ids.rekey_status.text = f"Rekey failed: {e}"
+            logger.exception("rekey failed")
         self._run_bg(work, done, err)
+
     def gui_rekey_random(self):
         def make_new_key():
             new_key = AESGCM.generate_key(256)
-            _atomic_write_bytes(KEY_PATH, new_key)
+            _store_wrapped_key(new_key)
             return new_key
         self._gui_rekey_common(make_new_key)
+
     def gui_rekey_passphrase_dialog(self):
         box = MDBoxLayout(orientation="vertical", spacing="12dp", padding="12dp", adaptive_height=True)
         pass_field = MDTextField(hint_text="Passphrase", password=True)
@@ -1454,17 +1773,44 @@ class SecureLLMApp(MDApp):
             ],
         )
         dlg.open()
+
     def _do_pass_rekey(self, dlg, pw1: str, pw2: str):
         if (pw1 or "") != (pw2 or "") or not (pw1 or "").strip():
             self.root.ids.rekey_status.text = "Passphrase mismatch or empty."
+            logger.warning("pass rekey mismatch/empty")
             return
         dlg.dismiss()
         pw = pw1.strip()
         def make_new_key():
             salt, derived = derive_key_from_passphrase(pw)
-            _atomic_write_bytes(KEY_PATH, salt + derived)
+            _store_wrapped_key(derived)
             return derived
         self._gui_rekey_common(make_new_key)
+
+    def gui_debug_refresh(self):
+        try:
+            meta = f"lines={len(_RING.text().splitlines())} | file={'YES' if LOG_PATH.exists() else 'no'} | path={str(LOG_PATH)}"
+            self.root.ids.debug_meta.text = meta
+            self.root.ids.debug_text.text = _RING.text() or "—"
+        except Exception:
+            pass
+
+    def gui_debug_clear(self):
+        _RING.clear()
+        try:
+            with _LOG_LOCK:
+                if LOG_PATH.exists():
+                    LOG_PATH.unlink()
+        except Exception:
+            pass
+        self.gui_debug_refresh()
+
+    def gui_debug_emit_test(self):
+        logger.info("debug emit test %s", uuid.uuid4().hex[:10])
+        try:
+            raise RuntimeError("debug test exception")
+        except Exception:
+            logger.exception("debug test exception")
 
 if __name__ == "__main__":
     SecureLLMApp().run()

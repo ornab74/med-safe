@@ -1,3 +1,4 @@
+
 name: Build Android (Debug / Release)
 
 on:
@@ -21,9 +22,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip"
-          cache-dependency-path: |
-            .github/workflows/android.yml
 
       - name: Install system dependencies (Kivy + crypto)
         run: |
@@ -65,9 +63,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip"
-          cache-dependency-path: |
-            .github/workflows/android.yml
 
       - name: Cache Buildozer / p4a / Gradle
         uses: actions/cache@v4
@@ -160,4 +155,3 @@ jobs:
           name: QRS-Android-APK-Debug
           path: bin/*.apk
           if-no-files-found: warn
-

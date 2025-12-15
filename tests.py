@@ -2,7 +2,8 @@ import os, asyncio, tempfile, unittest
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import app as m
+import main as m
+
 
 class TestCrypto(unittest.TestCase):
     def test_aesgcm_roundtrip(self):

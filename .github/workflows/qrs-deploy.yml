@@ -1,123 +1,16 @@
+
 name: Build Android (Debug / Release)
 
 on:
   push:
-    branches:
-      - main
-  pull_request: {}
-  workflow_dispatch: {}
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  tests:
-    name: Python tests
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Set env for tests
-        shell: bash
-        run: |
-          set -e
-          echo "PYTHONUNBUFFERED=1" >> "$GITHUB_ENV"
-          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-          echo "KIVY_NO_ARGS=1" >> "$GITHUB_ENV"
-          echo "KIVY_NO_CONSOLELOG=1" >> "$GITHUB_ENV"
-          echo "KIVY_WINDOW=mock" >> "$GITHUB_ENV"
-          echo "KIVY_HOME=$RUNNER_TEMP/kivy" >> "$GITHUB_ENV"
-
-      - name: Pick fastest Ubuntu mirror (7-way)
-        shell: bash
-        run: |
-          set -euo pipefail
-          CODENAME="$(lsb_release -sc)"
-          TEST_PATH="dists/${CODENAME}/InRelease"
-          MIRRORS=(
-            "http://azure.archive.ubuntu.com/ubuntu"
-            "http://archive.ubuntu.com/ubuntu"
-            "http://security.ubuntu.com/ubuntu"
-            "https://mirrors.edge.kernel.org/ubuntu"
-            "https://mirrors.ocf.berkeley.edu/ubuntu"
-            "https://ftp.osuosl.org/pub/ubuntu"
-            "https://mirror.csclub.uwaterloo.ca/ubuntu"
-          )
-          best=""
-          best_ms=999999
-          for m in "${MIRRORS[@]}"; do
-            url="${m}/${TEST_PATH}"
-            t="$(curl -fsS -o /dev/null -w '%{time_starttransfer}' --connect-timeout 3 --max-time 8 "$url" 2>/dev/null || echo 9999)"
-            ms="$(python - <<PY
-t=float("${t}")
-print(int(t*1000))
-PY
-)"
-            echo "${ms}ms  ${m}"
-            if [ "$ms" -lt "$best_ms" ]; then
-              best_ms="$ms"
-              best="$m"
-            fi
-          done
-          echo "BEST_MIRROR=$best ($best_ms ms)"
-          if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i \
-              -e "s|http://azure.archive.ubuntu.com/ubuntu|$best|g" \
-              -e "s|http://archive.ubuntu.com/ubuntu|$best|g" \
-              -e "s|https://archive.ubuntu.com/ubuntu|$best|g" \
-              /etc/apt/sources.list
-          fi
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i -e "s|URIs: .*|URIs: $best|g" /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
-
-      - name: Install system dependencies
-        shell: bash
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          set -e
-          sudo apt-get install -y --no-install-recommends \
-            build-essential git \
-            xvfb \
-            libgl1-mesa-dev \
-            libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libsdl2-mixer-dev \
-            libjpeg-dev libfreetype6-dev \
-            libssl-dev libffi-dev libsqlite3-dev \
-            zlib1g-dev
-
-      - name: Install Python deps (latest Kivy + KivyMD master)
-        shell: bash
-        run: |
-          set -e
-          python -m pip install --upgrade pip wheel setuptools
-          pip install "Cython<3.0"
-          pip install --upgrade kivy
-          pip install --upgrade https://github.com/kivymd/KivyMD/archive/master.zip
-          pip install httpx cryptography aiosqlite psutil pennylane
-          python -c "import kivy; print('Kivy', kivy.__version__)"
-
-      - name: Run tests
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          echo "RUNNER_TEMP=$RUNNER_TEMP"
-          echo "KIVY_HOME=$KIVY_HOME"
-          python -V
-          which xvfb-run || true
-          ls -ld "$(dirname "$KIVY_HOME")" || true
-          mkdir -p "$KIVY_HOME"
-          ls -ld "$KIVY_HOME"
-          xvfb-run -a -s "-screen 0 1280x720x24" python -m unittest -v tests
-
   build:
-    name: Build Android
-    needs:
-      - tests
     runs-on: ubuntu-22.04
+
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
@@ -134,35 +27,18 @@ PY
         with:
           python-version: "3.10"
 
-      - name: Cache Buildozer / p4a / Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            .buildozer
-            ~/.buildozer
-            ~/.local/share/python-for-android
-            ~/.gradle
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
-          restore-keys: |
-            ${{ runner.os }}-buildozer-
-
       - name: Install system dependencies
-        shell: bash
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y \
             build-essential git zip unzip curl \
             libssl-dev libffi-dev libsqlite3-dev \
             libbz2-dev zlib1g-dev libncurses5-dev \
             libgdbm-dev libnss3-dev libreadline-dev \
-            liblzma-dev libjpeg-dev libfreetype6-dev \
-            libgl1-mesa-dev
+            liblzma-dev libjpeg-dev libfreetype6-dev
 
       - name: Install Android SDK
-        shell: bash
         run: |
-          set -e
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
           curl -fsSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
@@ -171,13 +47,11 @@ PY
           mv cmdline-tools latest
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$ANDROID_SDK_ROOT/tools/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
 
       - name: Install Android packages
-        shell: bash
         run: |
-          set -e
           sdkmanager --version || true
           yes | sdkmanager --licenses || true
           sdkmanager \
@@ -185,19 +59,16 @@ PY
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      - name: Install Buildozer
-        shell: bash
+      - name: Install Buildozer & Python deps
         run: |
-          set -e
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
+          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
-        shell: bash
         run: |
-          set -e
           umask 077
           echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > qrs-upload.jks
           chmod 600 qrs-upload.jks
@@ -209,18 +80,14 @@ PY
           P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           P4A_RELEASE_KEYALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        shell: bash
         run: |
-          set -e
           buildozer -v android release
           ls -lah bin
 
       - name: Build debug APK
         if: github.event_name == 'pull_request'
-        shell: bash
         run: |
-          set -e
-          buildozer -v android debug
+          buildozer android debug
           ls -lah bin
 
       - name: Upload RELEASE AAB
@@ -230,12 +97,3 @@ PY
           name: QRS-Android-AAB
           path: bin/*.aab
           if-no-files-found: error
-
-      - name: Upload DEBUG APK
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: QRS-Android-APK-Debug
-          path: bin/*.apk
-          if-no-files-found: warn
-

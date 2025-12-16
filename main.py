@@ -28,7 +28,6 @@ from kivy.utils import platform as _kivy_platform
 from kivy.animation import Animation
 
 from kivymd.app import MDApp
-from kivymd.uix.toolbar import MDTopAppBar
 from kivymd.uix.label import MDLabel
 from kivymd.uix.button import MDRaisedButton, MDFlatButton, MDIconButton
 from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
@@ -43,14 +42,23 @@ if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 800)
 
 CHUNK = 1024 * 1024
-BOTTOM_NAV_H = 72
 
 def _android_files_dir() -> Optional[Path]:
-    if _kivy_platform != "android" or autoclass is None:
+    if _kivy_platform != "android":
+        return None
+    p = os.environ.get("ANDROID_PRIVATE", "")
+    if p:
+        try:
+            return Path(p)
+        except Exception:
+            pass
+    if autoclass is None:
         return None
     try:
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         ctx = PythonActivity.mActivity
+        if ctx is None:
+            return None
         return Path(str(ctx.getFilesDir().getAbsolutePath()))
     except Exception:
         return None
@@ -62,6 +70,9 @@ def _app_base_dir() -> Path:
             d = internal / "qroadscan_data"
             d.mkdir(parents=True, exist_ok=True)
             return d
+        d = Path("/data/local/tmp") / "qroadscan_data"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
     d = Path.cwd() / "qroadscan_data"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -99,7 +110,6 @@ class _FileHandler(logging.Handler):
     def __init__(self):
         super().__init__()
         self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
     def emit(self, record):
         try:
             msg = self._fmt.format(record)
@@ -159,7 +169,6 @@ def decrypt_file_gcm(src: Path, dst: Path, key32: bytes):
         fin.seek(tag_pos)
         tag = fin.read(16)
         fin.seek(12)
-
         dec = Cipher(algorithms.AES(key32), modes.GCM(nonce, tag)).decryptor()
         tmp = dst.with_suffix(dst.suffix + f".tmp.{uuid.uuid4().hex}")
         with tmp.open("wb") as fout:
@@ -223,7 +232,6 @@ def _unwrap_mdk() -> bytes:
         if len(mdk) != 32:
             raise RuntimeError("bad mdk length")
         return mdk
-
     if MODEL_BOOT_WRAP_PATH is None or not MODEL_BOOT_WRAP_PATH.exists():
         raise RuntimeError("Missing shipped .mdk.wrap (bootstrap)")
     blob = MODEL_BOOT_WRAP_PATH.read_bytes()
@@ -231,10 +239,8 @@ def _unwrap_mdk() -> bytes:
         mdk = decrypt_bytes_gcm(blob, bootstrap_key())
     except InvalidTag as e:
         raise RuntimeError("bootstrap unwrap failed (wrong bootstrap secret)") from e
-
     if len(mdk) != 32:
         raise RuntimeError("bad mdk length")
-
     new_master = os.urandom(32)
     _save_install_master(new_master)
     install_wrap = encrypt_bytes_gcm(mdk, new_master)
@@ -359,14 +365,11 @@ class BackgroundGradient(Widget):
     top_color = ListProperty([0.08, 0.10, 0.16, 1])
     bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
     steps = NumericProperty(56)
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
-
     def _lerp(self, a, b, t):
         return a + (b - a) * t
-
     def _redraw(self, *args):
         self.canvas.before.clear()
         x, y = self.pos
@@ -387,11 +390,9 @@ class GlassCard(Widget):
     fill = ListProperty([1, 1, 1, 0.06])
     border = ListProperty([1, 1, 1, 0.14])
     highlight = ListProperty([1, 1, 1, 0.09])
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, radius=self._redraw, fill=self._redraw, border=self._redraw, highlight=self._redraw)
-
     def _redraw(self, *args):
         self.canvas.clear()
         x, y = self.pos
@@ -410,11 +411,9 @@ class GlassCard(Widget):
 class StatusPill(Widget):
     text = StringProperty("Neutral")
     tone = StringProperty("neutral")
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, text=self._redraw, tone=self._redraw)
-
     def _tone_rgba(self):
         if self.tone == "good":
             return (0.10, 0.90, 0.42, 0.22)
@@ -423,7 +422,6 @@ class StatusPill(Widget):
         if self.tone == "bad":
             return (0.98, 0.22, 0.30, 0.22)
         return (1, 1, 1, 0.10)
-
     def _tone_line(self):
         if self.tone == "good":
             return (0.10, 0.90, 0.42, 0.30)
@@ -432,7 +430,6 @@ class StatusPill(Widget):
         if self.tone == "bad":
             return (0.98, 0.22, 0.30, 0.30)
         return (1, 1, 1, 0.16)
-
     def _redraw(self, *args):
         self.canvas.clear()
         x, y = self.pos
@@ -452,11 +449,9 @@ class RiskWheelNeo(Widget):
     value = NumericProperty(0.5)
     level = StringProperty("NEUTRAL")
     animated = BooleanProperty(True)
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, level=self._redraw)
-
     def set_level(self, level: str, animate: bool = True):
         lvl = (level or "").strip().upper()
         if lvl == "LOW":
@@ -473,7 +468,6 @@ class RiskWheelNeo(Widget):
             Animation(value=float(target_value), d=0.35, t="out_cubic").start(self)
         else:
             self.value = float(target_value)
-
     def _level_color(self):
         if self.level == "LOW":
             return (0.10, 0.90, 0.42)
@@ -482,10 +476,8 @@ class RiskWheelNeo(Widget):
         if self.level == "MEDIUM":
             return (0.98, 0.78, 0.20)
         return (0.78, 0.82, 0.90)
-
     def _seg_alpha(self):
         return 0.58 if self.level == "NEUTRAL" else 0.80
-
     def _redraw(self, *args):
         self.canvas.clear()
         cx, cy = self.center
@@ -933,7 +925,7 @@ MDScreen:
                                     height: "22dp"
 
                                 MDLabel:
-                                    text: "Base directory: " + app.base_dir_str
+                                    text: "Base directory: {}".format(app.base_dir_str)
                                     halign: "left"
                                     theme_text_color: "Secondary"
                                     size_hint_y: None
@@ -1029,14 +1021,12 @@ class SecureLLMApp(MDApp):
     _scan_lock = threading.Lock()
     _scan_inflight = False
     base_dir_str = StringProperty(str(BASE_DIR))
-
     def build(self):
         self.title = "Road Safe"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Blue"
         self.safe_top = dp(24) if _kivy_platform == "android" else 0
         return Builder.load_string(KV)
-
     def on_start(self):
         logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
         logger.info("pkg=%s shipped_models=%s", str(PKG_DIR), str(MODELS_SHIPPED))
@@ -1050,7 +1040,6 @@ class SecureLLMApp(MDApp):
         Clock.schedule_once(lambda dt: self.gui_debug_refresh(), 0.2)
         Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.6)
         Clock.schedule_once(lambda dt: self._route_first_boot(), 0.0)
-
     def _route_first_boot(self):
         try:
             if _is_first_boot():
@@ -1059,19 +1048,16 @@ class SecureLLMApp(MDApp):
                 self.switch_screen("road")
         except Exception:
             self.switch_screen("road")
-
     def accept_about(self):
         _mark_first_boot_done()
         self.switch_screen("road")
-
-    def _debug_auto_refresh(self):
+    def _debug_auto_refresh(self, *args):
         try:
             if self.root.ids.screen_manager.current == "debug" or self._debug_dirty:
                 self._debug_dirty = False
                 self.gui_debug_refresh()
         except Exception:
             pass
-
     def switch_screen(self, name: str):
         try:
             self.root.ids.screen_manager.current = name
@@ -1079,7 +1065,6 @@ class SecureLLMApp(MDApp):
             pass
         if name == "debug":
             self.gui_debug_refresh()
-
     def _pill(self, tone: str, text: str):
         try:
             road = self.root.ids.screen_manager.get_screen("road")
@@ -1087,7 +1072,6 @@ class SecureLLMApp(MDApp):
             road.ids.status_pill_text.text = text
         except Exception:
             pass
-
     def reset_ui(self):
         try:
             road = self.root.ids.screen_manager.get_screen("road")
@@ -1100,7 +1084,6 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
         self._scan_inflight = False
-
     def on_scan(self):
         if self._scan_inflight:
             return
@@ -1118,7 +1101,6 @@ class SecureLLMApp(MDApp):
             self._pill("warn", "Running")
         except Exception:
             pass
-
         data = {
             "location": (road.ids.loc_field.text or "").strip() or "unspecified",
             "road_type": "unknown",
@@ -1130,7 +1112,6 @@ class SecureLLMApp(MDApp):
         scan_id = uuid.uuid4().hex[:10]
         logger.info("SCAN_UI: clicked id=%s", scan_id)
         threading.Thread(target=self._scan_worker, args=(data, scan_id), daemon=True).start()
-
     def _scan_worker(self, data: dict, scan_id: str):
         try:
             label, raw = run_scan_blocking(data)
@@ -1138,7 +1119,6 @@ class SecureLLMApp(MDApp):
             logger.exception("SCAN: failed id=%s", scan_id)
             label, raw = "", f"[Error] {e}"
         Clock.schedule_once(lambda dt: self._scan_finish(label, raw, scan_id), 0)
-
     def _scan_finish(self, label: str, raw: str, scan_id: str):
         road = self.root.ids.screen_manager.get_screen("road")
         lvl = (label or "").strip().capitalize()
@@ -1165,7 +1145,6 @@ class SecureLLMApp(MDApp):
             pass
         self._scan_inflight = False
         logger.info("SCAN_UI: done id=%s label=%s raw=%s", scan_id, lvl, (raw or "")[:180].replace("\n", " "))
-
     def gui_debug_refresh(self):
         try:
             meta = f"file={'YES' if LOG_PATH.exists() else 'no'} | path={str(LOG_PATH)}"
@@ -1173,7 +1152,6 @@ class SecureLLMApp(MDApp):
             self.root.ids.debug_text.text = _read_log_tail()
         except Exception:
             pass
-
     def gui_debug_clear(self):
         try:
             if LOG_PATH.exists():

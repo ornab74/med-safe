@@ -1,4 +1,3 @@
-
 name: Build Android (Debug / Release)
 
 on:
@@ -20,7 +19,7 @@ jobs:
       MODEL_FILENAME: llama3-small-Q3_K_M.gguf
       MODEL_SHA256_EXPECTED: 8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
 
-      GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+      GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8'
       JAVA_TOOL_OPTIONS: -Xmx4096m
 
     steps:
@@ -67,93 +66,29 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      - name: Install Buildozer & Python deps (host)
+      - name: Install Buildozer & Python deps
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer cryptography
 
-      - name: Download GGUF model (build-time)
+      - name: Download GGUF model
         run: |
           mkdir -p models
-          curl -L --fail --retry 3 --retry-delay 2 -o "models/$MODEL_FILENAME" "$MODEL_URL"
-          ls -lah models
+          curl -L --fail -o "models/$MODEL_FILENAME" "$MODEL_URL"
 
-      - name: Verify GGUF SHA256 (build-time)
+      - name: Verify model SHA256
         run: |
           ACTUAL="$(sha256sum "models/$MODEL_FILENAME" | awk '{print $1}')"
-          if [ "$ACTUAL" != "$MODEL_SHA256_EXPECTED" ]; then
-            echo "ERROR: Model SHA256 mismatch"
-            exit 1
-          fi
+          [ "$ACTUAL" = "$MODEL_SHA256_EXPECTED" ]
 
-      - name: Encrypt model + create wrapped MDK (no runtime internet needed)
+      - name: Encrypt model
         env:
           BOOTSTRAP_SECRET: ${{ secrets.BOOTSTRAP_SECRET }}
         run: |
-          if [ -z "$BOOTSTRAP_SECRET" ]; then
-            echo "ERROR: Missing secrets.BOOTSTRAP_SECRET"
-            exit 1
-          fi
           mkdir -p tools
-          cat > tools/prepare_model.py <<'PY'
-          import os, sys, hashlib
-          from pathlib import Path
-          from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-          from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-          from cryptography.hazmat.primitives import hashes
-          CHUNK = 1024 * 1024
-          def sha256_file(p: Path) -> str:
-              h = hashlib.sha256()
-              with p.open("rb") as f:
-                  for chunk in iter(lambda: f.read(CHUNK), b""):
-                      h.update(chunk)
-              return h.hexdigest()
-          def hkdf32(secret: bytes, info: bytes) -> bytes:
-              return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
-          def encrypt_file_gcm(src: Path, dst: Path, key32: bytes):
-              nonce = os.urandom(12)
-              enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
-              tmp = dst.with_suffix(dst.suffix + ".tmp")
-              with src.open("rb") as fin, tmp.open("wb") as fout:
-                  fout.write(nonce)
-                  while True:
-                      buf = fin.read(CHUNK)
-                      if not buf:
-                          break
-                      fout.write(enc.update(buf))
-                  enc.finalize()
-                  fout.write(enc.tag)
-              tmp.replace(dst)
-          def encrypt_bytes_gcm(pt: bytes, key32: bytes) -> bytes:
-              nonce = os.urandom(12)
-              enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
-              ct = enc.update(pt) + enc.finalize()
-              return nonce + ct + enc.tag
-          def main():
-              secret = os.environ.get("BOOTSTRAP_SECRET", "").encode("utf-8")
-              if not secret:
-                  sys.exit(2)
-              if len(sys.argv) != 3:
-                  sys.exit(2)
-              src = Path(sys.argv[1]).resolve()
-              out_dir = Path(sys.argv[2]).resolve()
-              out_dir.mkdir(parents=True, exist_ok=True)
-              model_name = src.name
-              out_enc = out_dir / (model_name + ".aes")
-              out_wrap = out_dir / (model_name + ".mdk.wrap")
-              out_sha  = out_dir / (model_name + ".sha256")
-              mdk = os.urandom(32)
-              bootstrap_key = hkdf32(secret, b"qroadscan/bootstrap/v1")
-              encrypt_file_gcm(src, out_enc, mdk)
-              out_wrap.write_bytes(encrypt_bytes_gcm(mdk, bootstrap_key))
-              out_sha.write_text(sha256_file(src), encoding="utf-8")
-          if __name__ == "__main__":
-              main()
-          PY
           python tools/prepare_model.py "models/$MODEL_FILENAME" models
           rm -f "models/$MODEL_FILENAME"
-          ls -lah models
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
@@ -169,14 +104,10 @@ jobs:
           P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           P4A_RELEASE_KEYALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          buildozer -v android release
-          ls -lah bin
+        run: buildozer -v android release
 
       - name: Build debug APK
-        run: |
-          buildozer -v android debug
-          ls -lah bin
+        run: buildozer -v android debug
 
       - name: Upload RELEASE AAB
         if: github.event_name != 'pull_request'
@@ -184,12 +115,9 @@ jobs:
         with:
           name: QRS-Android-AAB
           path: bin/*.aab
-          if-no-files-found: error
 
       - name: Upload DEBUG APK
         uses: actions/upload-artifact@v4
         with:
           name: QRS-Android-APK
           path: bin/*.apk
-          if-no-files-found: error
-```0

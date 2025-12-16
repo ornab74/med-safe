@@ -21,8 +21,8 @@ p4a.local_recipes = ./p4a_recipes
 orientation = portrait
 fullscreen = 0
 
-include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 
+include_patterns = models/*,models/*.mdk.wrap,models/*.sha256,bootstrap_secret.py,*.gguf,*.aes,*.db,*.json
 android.permissions = 
 
 android.sdk_path = /usr/local/lib/android/sdk

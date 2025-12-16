@@ -1,3 +1,4 @@
+
 import os
 import sys
 import time
@@ -48,7 +49,6 @@ from kivy.lang import Builder
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.uix.widget import Widget
-from kivy.uix.screenmanager import ScreenManager
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
 from kivy.properties import NumericProperty, StringProperty, ListProperty
@@ -57,7 +57,7 @@ from kivy.utils import platform as _kivy_platform
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton, MDRaisedButton
-from kivymd.uix.list import TwoLineListItem
+from kivymd.uix.list import TwoLineListItem, MDList
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.progressbar import MDProgressBar
@@ -65,7 +65,6 @@ from kivymd.uix.toolbar import MDTopAppBar
 from kivymd.uix.label import MDLabel
 from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
 from kivymd.uix.screen import MDScreen
-
 
 if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 760)
@@ -76,6 +75,9 @@ _LOG_LOCK = RLock()
 
 _MODEL_USERS = 0
 _ANDROID_KEY_ALIAS = "qroadscan_master_rsa_v1"
+
+MAX_DB_BYTES = 2 * 1024 * 1024
+MAX_HISTORY_ROWS = 500
 
 
 def _is_writable_dir(p: Path) -> bool:
@@ -89,9 +91,6 @@ def _is_writable_dir(p: Path) -> bool:
         return False
 
 
-# ----------------------------
-# ANDROID STORAGE (FIXED)
-# ----------------------------
 def _android_context():
     if _kivy_platform != "android" or autoclass is None:
         return None
@@ -117,7 +116,7 @@ def _android_external_files_dir() -> Optional[Path]:
     if not ctx:
         return None
     try:
-        ext = ctx.getExternalFilesDir(None)  # app-scoped external (no permission)
+        ext = ctx.getExternalFilesDir(None)
         if ext is None:
             return None
         return Path(str(ext.getAbsolutePath()))
@@ -126,34 +125,25 @@ def _android_external_files_dir() -> Optional[Path]:
 
 
 def _app_base_dir() -> Path:
-    # Android: NEVER fall back to __file__/APK paths (read-only).
     if _kivy_platform == "android":
-        # Prefer app-scoped external for big files if available, otherwise internal.
         ext = _android_external_files_dir()
         if ext:
             d = ext / "qroadscan_data"
             if _is_writable_dir(d):
                 return d
-
         internal = _android_files_dir()
         if internal:
             d = internal / "qroadscan_data"
             d.mkdir(parents=True, exist_ok=True)
             return d
-
-        # last-resort: whatever p4a exposes (should still be internal)
         p = os.environ.get("ANDROID_PRIVATE")
         if p:
             d = Path(p) / "qroadscan_data"
             d.mkdir(parents=True, exist_ok=True)
             return d
-
-        # If we got here, something is wrong with runtime environment.
         d = Path.cwd() / "qroadscan_data"
         d.mkdir(parents=True, exist_ok=True)
         return d
-
-    # Non-Android (desktop/dev)
     base = Path(__file__).resolve().parent
     d = base / "qroadscan_data"
     d.mkdir(parents=True, exist_ok=True)
@@ -335,7 +325,6 @@ def _android_keystore_ensure_rsa(alias: str):
     ks = _android_keystore_get()
     if ks.containsAlias(alias):
         return
-
     KeyPairGenerator = autoclass("java.security.KeyPairGenerator")
     KeyProperties = autoclass("android.security.keystore.KeyProperties")
     KeyGenParameterSpecBuilder = autoclass(
@@ -397,7 +386,6 @@ def _load_wrapped_key() -> Optional[bytes]:
         except Exception:
             logger.exception("key unwrap failed")
             return None
-
     k = d[:32] if len(d) >= 32 else None
     if k:
         logger.info("key loaded: file raw (non-android)")
@@ -492,7 +480,6 @@ def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 102
             fin.seek(tag_pos)
             tag = fin.read(16)
             fin.seek(12)
-
             dec = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
             tmp = dest.with_suffix(dest.suffix + f".dec.{uuid.uuid4().hex}")
             with tmp.open("wb") as fout:
@@ -524,6 +511,13 @@ def _safe_decrypt_db_to(tmp_plain: Path, master_key: bytes) -> bool:
     if not DB_PATH.exists():
         return False
     try:
+        try:
+            if DB_PATH.stat().st_size > MAX_DB_BYTES:
+                logger.warning("db too large (%d bytes), archiving", DB_PATH.stat().st_size)
+                _mark_corrupt(DB_PATH)
+                return False
+        except Exception:
+            pass
         with _CRYPTO_LOCK:
             pt = aes_decrypt(DB_PATH.read_bytes(), _db_key(master_key))
             _atomic_write_bytes(tmp_plain, pt)
@@ -577,6 +571,10 @@ async def log_interaction(prompt: str, response: str, master_key: bytes):
             await db.execute(
                 "INSERT INTO history (timestamp, prompt, response) VALUES (?, ?, ?)",
                 (time.strftime("%Y-%m-%d %H:%M:%S"), prompt, response),
+            )
+            await db.execute(
+                "DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+                (MAX_HISTORY_ROWS,),
             )
             await db.commit()
 
@@ -759,7 +757,6 @@ def collect_system_metrics() -> Dict[str, float]:
                 load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_cnt))))
             except Exception:
                 load1 = None
-
             try:
                 temps_map = psutil.sensors_temperatures()
                 if temps_map:
@@ -769,7 +766,6 @@ def collect_system_metrics() -> Dict[str, float]:
                     temp = None
             except Exception:
                 temp = None
-
             try:
                 proc = min(len(psutil.pids()) / 1000.0, 1.0)
             except Exception:
@@ -1041,7 +1037,6 @@ def acquire_plain_model(master_key: bytes):
         if not MODEL_PATH.exists() and not ENCRYPTED_MODEL.exists():
             raise FileNotFoundError("Model not found")
         _MODEL_USERS += 1
-
     try:
         yield MODEL_PATH
     finally:
@@ -1115,9 +1110,6 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
         return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]"
 
 
-# ----------------------------
-# UI WIDGETS (NO ANIMATIONS)
-# ----------------------------
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.07, 0.09, 0.14, 1])
     bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
@@ -1671,6 +1663,7 @@ MDScreen:
                                     height: self.texture_size[1]
 
         MDBottomNavigation:
+            id: bottom_nav
             size_hint_y: None
             height: "72dp"
             panel_color: 0.08,0.09,0.12,1
@@ -1723,14 +1716,11 @@ class SecureLLMApp(MDApp):
     def on_start(self):
         _cleanup_tmp_dir()
         logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
-
         try:
             self.root.ids.screen_manager.current = "road"
         except Exception:
             pass
-
         Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
-        Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
         Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.35)
 
     def _debug_auto_refresh(self):
@@ -1745,6 +1735,8 @@ class SecureLLMApp(MDApp):
         self.root.ids.screen_manager.current = name
         if name == "debug":
             self.gui_debug_refresh()
+        if name == "history":
+            self.gui_history_refresh()
 
     def set_status(self, text: str):
         self.root.ids.status_label.text = text
@@ -1820,7 +1812,6 @@ class SecureLLMApp(MDApp):
 
         def work():
             get_or_create_key()
-
             last_pct = {"v": -1}
             last_t = {"v": 0.0}
 
@@ -1942,9 +1933,12 @@ class SecureLLMApp(MDApp):
 
         def work():
             master = get_or_create_key()
-            asyncio.run(init_db(master))
-            rows = asyncio.run(fetch_history(master, limit=per_page, offset=page * per_page, search=search))
-            return rows
+
+            async def job():
+                await init_db(master)
+                return await fetch_history(master, limit=per_page, offset=page * per_page, search=search)
+
+            return asyncio.run(job())
 
         def done(rows):
             self.set_status("")

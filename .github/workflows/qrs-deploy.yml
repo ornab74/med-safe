@@ -13,10 +13,14 @@ jobs:
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROIDSDK: /usr/local/lib/android/sdk
 
-      # Model settings (change these)
+      # ===== Model (build-time only) =====
       MODEL_URL: https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
       MODEL_FILENAME: llama3-small-Q3_K_M.gguf
+
+      # ✅ Hardcoded expected SHA256 of the plaintext GGUF you download
+      MODEL_SHA256_EXPECTED: 8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
 
     steps:
       - uses: actions/checkout@v4
@@ -48,26 +52,34 @@ jobs:
           unzip -q tools.zip
           rm tools.zip
           mv cmdline-tools latest
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
 
-      - name: Install Android packages (API 34)
+          # ✅ Create legacy tools/bin path expected by older p4a/buildozer checks
+          mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
+          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
+
+          # Put both on PATH
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
+
+      - name: Install Android packages (API 35)
         run: |
+          sdkmanager --version
           yes | sdkmanager --licenses || true
           sdkmanager \
             "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Install Buildozer & Python deps (host)
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
-          # cryptography needed for the build-time model encryption script
+          # used for build-time encryption step
           pip install cryptography
 
       # ---------------------------
-      # Build-time OFFLINE MODEL PACKAGING
+      # Build-time OFFLINE MODEL PACKAGING (download + hash check + encrypt)
       # ---------------------------
       - name: Download GGUF model (build-time)
         run: |
@@ -75,6 +87,17 @@ jobs:
           echo "Downloading model from: $MODEL_URL"
           curl -L --fail --retry 3 --retry-delay 2 -o "models/$MODEL_FILENAME" "$MODEL_URL"
           ls -lah models
+
+      - name: Verify GGUF SHA256 (build-time)
+        run: |
+          echo "Expected SHA256: $MODEL_SHA256_EXPECTED"
+          ACTUAL="$(sha256sum "models/$MODEL_FILENAME" | awk '{print $1}')"
+          echo "Actual SHA256:   $ACTUAL"
+          if [ "$ACTUAL" != "$MODEL_SHA256_EXPECTED" ]; then
+            echo "ERROR: Model SHA256 mismatch"
+            exit 1
+          fi
+          echo "SHA256 OK"
 
       - name: Encrypt model + create wrapped MDK (no runtime internet needed)
         env:
@@ -85,7 +108,6 @@ jobs:
             exit 1
           fi
 
-          # Create tools script if you haven't committed it yet.
           mkdir -p tools
           cat > tools/prepare_model.py <<'PY'
           import os, sys, hashlib
@@ -146,7 +168,10 @@ jobs:
               out_wrap = out_dir / (model_name + ".mdk.wrap")
               out_sha  = out_dir / (model_name + ".sha256")
 
+              # Model Data Key (MDK) encrypts GGUF
               mdk = os.urandom(32)
+
+              # Bootstrap key wraps MDK
               bootstrap_key = hkdf32(secret, b"qroadscan/bootstrap/v1")
 
               encrypt_file_gcm(src, out_enc, mdk)
@@ -163,7 +188,7 @@ jobs:
 
           python tools/prepare_model.py "models/$MODEL_FILENAME" models
 
-          # Remove plaintext model so it never ships
+          # ✅ Remove plaintext model so it never ships
           rm -f "models/$MODEL_FILENAME"
 
           echo "Models directory after encryption:"

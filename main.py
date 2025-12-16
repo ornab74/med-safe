@@ -1093,7 +1093,6 @@ class GlassCard(Widget):
             _shine_x=self._redraw,
             _shine_alpha=self._redraw,
         )
-        Clock.schedule_once(lambda dt: self._start_shine(), 0.2)
 
     def _start_shine(self):
         self._shine_x = -0.3
@@ -1133,7 +1132,6 @@ class RiskWheelNeo(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, sweep=self._redraw, glow=self._redraw, level=self._redraw)
-        Clock.schedule_once(lambda dt: self._start_sweep(), 0.05)
 
     def _start_sweep(self):
         a = Animation(sweep=1.0, duration=2.2, t="linear")
@@ -1237,6 +1235,7 @@ MDScreen:
             halign: "center"
         ScreenManager:
             id: screen_manager
+            size_hint_y: 1
 
             MDScreen:
                 name: "road"
@@ -1247,78 +1246,85 @@ MDScreen:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
-                    FloatLayout:
-                        size_hint_y: None
-                        height: "650dp"
-                        GlassCard:
-                            pos: self.parent.pos
-                            size: self.parent.size
-                            height: self.parent.height
-                            radius: dp(26)
-                            fill: 1, 1, 1, 0.055
-                            border: 1, 1, 1, 0.13
-                            highlight: 1, 1, 1, 0.08
-                        MDBoxLayout:
-                            orientation: "vertical"
-                            padding: "14dp"
-                            spacing: "10dp"
-                            pos: self.parent.pos
-                            size: self.parent.size
-                            MDLabel:
-                                text: "Road Risk Scanner"
-                                bold: True
-                                font_style: "H6"
-                                halign: "center"
-                                size_hint_y: None
-                                height: "32dp"
+                    ScrollView:
+                        do_scroll_x: False
+                        FloatLayout:
+                            size_hint_x: 1
+                            size_hint_y: None
+                            height: max(content.minimum_height, self.parent.height)
+                            GlassCard:
+                                pos: self.parent.pos
+                                size: self.parent.size
+                                radius: dp(26)
+                                fill: 1, 1, 1, 0.055
+                                border: 1, 1, 1, 0.13
+                                highlight: 1, 1, 1, 0.08
                             MDBoxLayout:
-                                size_hint_y: None
-                                height: "250dp"
-                                padding: "6dp"
-                                RiskWheelNeo:
-                                    id: risk_wheel
-                                    size: "240dp", "240dp"
-                                    pos_hint: {"center_x": 0.5, "center_y": 0.55}
-                            MDLabel:
-                                id: risk_text
-                                text: "RISK: —"
-                                halign: "center"
-                                size_hint_y: None
-                                height: "22dp"
-                            MDTextField:
-                                id: loc_field
-                                hint_text: "Location (e.g., I-95 NB mile 12)"
-                                mode: "fill"
-                            MDTextField:
-                                id: road_type_field
-                                hint_text: "Road type (highway/urban/residential)"
-                                mode: "fill"
-                            MDTextField:
-                                id: weather_field
-                                hint_text: "Weather/visibility"
-                                mode: "fill"
-                            MDTextField:
-                                id: traffic_field
-                                hint_text: "Traffic density (low/med/high)"
-                                mode: "fill"
-                            MDTextField:
-                                id: obstacles_field
-                                hint_text: "Reported obstacles"
-                                mode: "fill"
-                            MDTextField:
-                                id: sensor_notes_field
-                                hint_text: "Sensor notes"
-                                mode: "fill"
-                            MDRaisedButton:
-                                text: "Scan Risk"
+                                id: content
+                                orientation: "vertical"
                                 size_hint_x: 1
-                                on_release: app.on_scan()
-                            MDLabel:
-                                id: scan_result
-                                text: ""
-                                halign: "center"
+                                width: self.parent.width
                                 size_hint_y: None
-                                height: "24dp"
+                                height: self.minimum_height
+                                x: self.parent.x
+                                y: self.parent.y
+                                padding: "14dp"
+                                spacing: "10dp"
+                                MDLabel:
+                                    text: "Road Risk Scanner"
+                                    bold: True
+                                    font_style: "H6"
+                                    halign: "center"
+                                    size_hint_y: None
+                                    height: "32dp"
+                                MDBoxLayout:
+                                    size_hint_y: None
+                                    height: "250dp"
+                                    padding: "6dp"
+                                    RiskWheelNeo:
+                                        id: risk_wheel
+                                        size: "240dp", "240dp"
+                                        pos_hint: {"center_x": 0.5, "center_y": 0.55}
+                                MDLabel:
+                                    id: risk_text
+                                    text: "RISK: —"
+                                    halign: "center"
+                                    size_hint_y: None
+                                    height: "22dp"
+                                MDTextField:
+                                    id: loc_field
+                                    hint_text: "Location (e.g., I-95 NB mile 12)"
+                                    mode: "fill"
+                                MDTextField:
+                                    id: road_type_field
+                                    hint_text: "Road type (highway/urban/residential)"
+                                    mode: "fill"
+                                MDTextField:
+                                    id: weather_field
+                                    hint_text: "Weather/visibility"
+                                    mode: "fill"
+                                MDTextField:
+                                    id: traffic_field
+                                    hint_text: "Traffic density (low/med/high)"
+                                    mode: "fill"
+                                MDTextField:
+                                    id: obstacles_field
+                                    hint_text: "Reported obstacles"
+                                    mode: "fill"
+                                MDTextField:
+                                    id: sensor_notes_field
+                                    hint_text: "Sensor notes"
+                                    mode: "fill"
+                                MDRaisedButton:
+                                    text: "Scan Risk"
+                                    size_hint_x: 1
+                                    on_release: app.on_scan()
+                                MDLabel:
+                                    id: scan_result
+                                    text: ""
+                                    halign: "center"
+                                    size_hint_y: None
+                                    height: "24dp"
 
             MDScreen:
                 name: "model"
@@ -1562,6 +1568,8 @@ MDScreen:
                                     height: self.texture_size[1]
 
         MDBottomNavigation:
+            size_hint_y: None
+            height: "72dp"
             panel_color: 0.08,0.09,0.12,1
             MDBottomNavigationItem:
                 name: "nav_road"

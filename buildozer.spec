@@ -9,9 +9,9 @@ package.domain = com.qroadscan
 source.dir = .
 source.main = main.py
 
-version = 0.1.10
+version = 0.1.11
 
-android.version_code = 1025010
+android.version_code = 1025011
 
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
 
@@ -22,7 +22,7 @@ fullscreen = 0
 
 include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 
-android.permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+android.permissions = 
 
 android.sdk_path = /usr/local/lib/android/sdk
 

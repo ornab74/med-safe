@@ -1,3 +1,4 @@
+
 import os
 import re
 import uuid
@@ -7,10 +8,12 @@ import hashlib
 import threading
 import logging
 import gc
+import random
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List, Callable
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -32,57 +35,97 @@ from kivymd.uix.label import MDLabel
 from kivymd.uix.button import MDRaisedButton, MDFlatButton, MDIconButton
 from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
 from kivymd.uix.screen import MDScreen
+from kivymd.uix.textfield import MDTextField
+from kivymd.uix.boxlayout import MDBoxLayout
+
+try:
+    from kivymd.uix.toolbar import MDTopAppBar as _MDAppBar
+    _APPBAR_NAME = "MDTopAppBar"
+except Exception:
+    from kivymd.uix.toolbar import MDToolbar as _MDAppBar
+    _APPBAR_NAME = "MDToolbar"
 
 try:
     from jnius import autoclass
 except Exception:
     autoclass = None
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import pennylane as qml
+    import pennylane.numpy as pnp
+except Exception:
+    qml = None
+    pnp = None
+
 if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 800)
 
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 CHUNK = 1024 * 1024
-
-def _android_files_dir() -> Optional[Path]:
-    if _kivy_platform != "android":
-        return None
-    p = os.environ.get("ANDROID_PRIVATE", "")
-    if p:
-        try:
-            return Path(p)
-        except Exception:
-            pass
-    if autoclass is None:
-        return None
-    try:
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        ctx = PythonActivity.mActivity
-        if ctx is None:
-            return None
-        return Path(str(ctx.getFilesDir().getAbsolutePath()))
-    except Exception:
-        return None
-
-def _app_base_dir() -> Path:
-    if _kivy_platform == "android":
-        internal = _android_files_dir()
-        if internal:
-            d = internal / "qroadscan_data"
-            d.mkdir(parents=True, exist_ok=True)
-            return d
-        d = Path("/data/local/tmp") / "qroadscan_data"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-    d = Path.cwd() / "qroadscan_data"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-BASE_DIR = _app_base_dir()
-TMP_DIR = BASE_DIR / "tmp"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 PKG_DIR = Path(__file__).resolve().parent
 MODELS_SHIPPED = PKG_DIR / "models"
+
+BASE_DIR: Optional[Path] = None
+TMP_DIR: Optional[Path] = None
+INSTALL_MASTER_PATH: Optional[Path] = None
+INSTALL_MDK_WRAP_PATH: Optional[Path] = None
+FIRST_BOOT_FLAG_PATH: Optional[Path] = None
+LOG_PATH: Optional[Path] = None
+
+logger = logging.getLogger("qroadscan")
+logger.setLevel(logging.INFO)
+
+class _FileHandler(logging.Handler):
+    def __init__(self, get_log_path: Callable[[], Optional[Path]]):
+        super().__init__()
+        self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        self._get_log_path = get_log_path
+
+    def emit(self, record):
+        try:
+            msg = self._fmt.format(record)
+        except Exception:
+            msg = str(record.getMessage())
+        try:
+            lp = self._get_log_path()
+            if lp is not None:
+                lp.parent.mkdir(parents=True, exist_ok=True)
+                with lp.open("a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+        except Exception:
+            pass
+        try:
+            app = MDApp.get_running_app()
+            if app:
+                app._debug_dirty = True
+        except Exception:
+            pass
+
+def _get_log_path() -> Optional[Path]:
+    return LOG_PATH
+
+if not any(isinstance(h, _FileHandler) for h in logger.handlers):
+    logger.addHandler(_FileHandler(_get_log_path))
+
+def _read_log_tail(max_chars: int = 140_000) -> str:
+    try:
+        if LOG_PATH is None or not LOG_PATH.exists():
+            return "—"
+        t = LOG_PATH.read_text(encoding="utf-8", errors="ignore")
+        return t[-max_chars:] if len(t) > max_chars else t
+    except Exception:
+        return "—"
 
 def _pick_model_files():
     if not MODELS_SHIPPED.exists():
@@ -98,47 +141,9 @@ def _pick_model_files():
 
 MODEL_ENC_PATH, MODEL_BOOT_WRAP_PATH, MODEL_SHA_PATH = _pick_model_files()
 
-INSTALL_MASTER_PATH = BASE_DIR / ".install_master_key"
-INSTALL_MDK_WRAP_PATH = BASE_DIR / ".mdk.wrap.install"
-FIRST_BOOT_FLAG_PATH = BASE_DIR / ".first_boot_done"
-
-LOG_PATH = BASE_DIR / "debug.log"
-logger = logging.getLogger("qroadscan")
-logger.setLevel(logging.INFO)
-
-class _FileHandler(logging.Handler):
-    def __init__(self):
-        super().__init__()
-        self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    def emit(self, record):
-        try:
-            msg = self._fmt.format(record)
-        except Exception:
-            msg = str(record.getMessage())
-        try:
-            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-        except Exception:
-            pass
-        try:
-            app = MDApp.get_running_app()
-            if app:
-                app._debug_dirty = True
-        except Exception:
-            pass
-
-if not any(isinstance(h, _FileHandler) for h in logger.handlers):
-    logger.addHandler(_FileHandler())
-
-def _read_log_tail(max_chars: int = 140_000) -> str:
-    try:
-        if not LOG_PATH.exists():
-            return "—"
-        t = LOG_PATH.read_text(encoding="utf-8", errors="ignore")
-        return t[-max_chars:] if len(t) > max_chars else t
-    except Exception:
-        return "—"
+def _require_paths():
+    if BASE_DIR is None or TMP_DIR is None or INSTALL_MASTER_PATH is None or INSTALL_MDK_WRAP_PATH is None or FIRST_BOOT_FLAG_PATH is None or LOG_PATH is None:
+        raise RuntimeError("paths not initialized")
 
 def hkdf32(secret: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
@@ -213,6 +218,7 @@ def bootstrap_key() -> bytes:
     return hkdf32(_get_bootstrap_secret(), b"qroadscan/bootstrap/v1")
 
 def _load_install_master() -> Optional[bytes]:
+    _require_paths()
     try:
         if not INSTALL_MASTER_PATH.exists():
             return None
@@ -222,16 +228,28 @@ def _load_install_master() -> Optional[bytes]:
         return None
 
 def _save_install_master(k: bytes):
+    _require_paths()
     _atomic_write(INSTALL_MASTER_PATH, k)
 
 def _unwrap_mdk() -> bytes:
+    _require_paths()
     master = _load_install_master()
     if master and INSTALL_MDK_WRAP_PATH.exists():
-        blob = INSTALL_MDK_WRAP_PATH.read_bytes()
-        mdk = decrypt_bytes_gcm(blob, master)
-        if len(mdk) != 32:
-            raise RuntimeError("bad mdk length")
-        return mdk
+        try:
+            blob = INSTALL_MDK_WRAP_PATH.read_bytes()
+            mdk = decrypt_bytes_gcm(blob, master)
+            if len(mdk) != 32:
+                raise RuntimeError("bad mdk length")
+            return mdk
+        except Exception:
+            try:
+                INSTALL_MDK_WRAP_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                INSTALL_MASTER_PATH.unlink(missing_ok=True)
+            except Exception:
+                pass
     if MODEL_BOOT_WRAP_PATH is None or not MODEL_BOOT_WRAP_PATH.exists():
         raise RuntimeError("Missing shipped .mdk.wrap (bootstrap)")
     blob = MODEL_BOOT_WRAP_PATH.read_bytes()
@@ -249,16 +267,16 @@ def _unwrap_mdk() -> bytes:
     return mdk
 
 def _tmp_plain_model_path() -> Path:
+    _require_paths()
     return TMP_DIR / f"model_plain.{uuid.uuid4().hex}.gguf"
 
 @contextmanager
 def acquire_plain_model() -> Path:
+    _require_paths()
     if MODEL_ENC_PATH is None or not MODEL_ENC_PATH.exists():
         raise FileNotFoundError("Missing shipped encrypted model (.aes) in ./models")
-    logger.info("MODEL: encrypted=%s", str(MODEL_ENC_PATH))
     mdk = _unwrap_mdk()
     plain = _tmp_plain_model_path()
-    logger.info("MODEL: decrypt -> %s", str(plain))
     decrypt_file_gcm(MODEL_ENC_PATH, plain, mdk)
     try:
         if MODEL_SHA_PATH is not None and MODEL_SHA_PATH.exists():
@@ -267,7 +285,6 @@ def acquire_plain_model() -> Path:
                 actual = sha256_file(plain)
                 if actual.lower() != expected.lower():
                     raise RuntimeError(f"model sha mismatch: {actual} != {expected}")
-                logger.info("MODEL: sha256 OK")
     except Exception:
         try:
             plain.unlink(missing_ok=True)
@@ -283,14 +300,12 @@ def acquire_plain_model() -> Path:
             pass
 
 def load_llama(model_path: Path):
-    logger.info("LLAMA: import llama_cpp")
     from llama_cpp import Llama
-    threads = 2
     try:
-        threads = 2 if (os.cpu_count() or 1) >= 2 else 1
+        c = os.cpu_count() or 1
     except Exception:
-        threads = 2
-    logger.info("LLAMA: init (use_mmap=False, n_ctx=512, n_batch=64, threads=%d)", threads)
+        c = 1
+    threads = 2 if c >= 2 else 1
     return Llama(
         model_path=str(model_path),
         n_ctx=512,
@@ -300,6 +315,344 @@ def load_llama(model_path: Path):
         use_mlock=False,
         n_gpu_layers=0,
         verbose=False,
+    )
+
+def _read_proc_stat():
+    try:
+        with open("/proc/stat", "r") as f:
+            line = f.readline()
+        if not line.startswith("cpu "):
+            return None
+        parts = line.split()
+        vals = [int(x) for x in parts[1:]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        total = sum(vals)
+        return total, idle
+    except Exception:
+        return None
+
+def _cpu_percent_from_proc(sample_interval=0.12):
+    t1 = _read_proc_stat()
+    if not t1:
+        return None
+    time.sleep(sample_interval)
+    t2 = _read_proc_stat()
+    if not t2:
+        return None
+    total1, idle1 = t1
+    total2, idle2 = t2
+    total_delta = total2 - total1
+    idle_delta = idle2 - idle1
+    if total_delta <= 0:
+        return None
+    usage = (total_delta - idle_delta) / float(total_delta)
+    return max(0.0, min(1.0, usage))
+
+def _mem_from_proc():
+    try:
+        info = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) < 2:
+                    continue
+                k = parts[0].strip()
+                v = parts[1].strip().split()[0]
+                info[k] = int(v)
+        total = info.get("MemTotal")
+        available = info.get("MemAvailable", None)
+        if total is None:
+            return None
+        if available is None:
+            available = info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
+        used_fraction = max(0.0, min(1.0, (total - available) / float(total)))
+        return used_fraction
+    except Exception:
+        return None
+
+def _load1_from_proc(cpu_count_fallback=1):
+    try:
+        with open("/proc/loadavg", "r") as f:
+            first = f.readline().split()[0]
+        load1 = float(first)
+        try:
+            cpu_cnt = os.cpu_count() or cpu_count_fallback
+        except Exception:
+            cpu_cnt = cpu_count_fallback
+        val = load1 / max(1.0, float(cpu_cnt))
+        return max(0.0, min(1.0, val))
+    except Exception:
+        return None
+
+def _proc_count_from_proc():
+    try:
+        pids = [name for name in os.listdir("/proc") if name.isdigit()]
+        return max(0.0, min(1.0, len(pids) / 1000.0))
+    except Exception:
+        return None
+
+def _read_temperature():
+    temps = []
+    try:
+        base = "/sys/class/thermal"
+        if os.path.isdir(base):
+            for entry in os.listdir(base):
+                if not entry.startswith("thermal_zone"):
+                    continue
+                path = os.path.join(base, entry, "temp")
+                try:
+                    with open(path, "r") as f:
+                        raw = f.read().strip()
+                    if not raw:
+                        continue
+                    val = int(raw)
+                    c = val / 1000.0 if val > 1000 else float(val)
+                    temps.append(c)
+                except Exception:
+                    continue
+        if not temps:
+            return None
+        avg_c = sum(temps) / len(temps)
+        norm = (avg_c - 20.0) / (90.0 - 20.0)
+        return max(0.0, min(1.0, norm))
+    except Exception:
+        return None
+
+def collect_system_metrics() -> Dict[str, float]:
+    cpu = mem = load1 = temp = proc = None
+    if psutil is not None:
+        try:
+            cpu = psutil.cpu_percent(interval=0.1) / 100.0
+            mem = psutil.virtual_memory().percent / 100.0
+            try:
+                load_raw = os.getloadavg()[0]
+                cpu_cnt = psutil.cpu_count(logical=True) or 1
+                load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_cnt))))
+            except Exception:
+                load1 = None
+            try:
+                temps_map = psutil.sensors_temperatures()
+                if temps_map:
+                    first = next(iter(temps_map.values()))[0].current
+                    temp = max(0.0, min(1.0, (first - 20.0) / 70.0))
+                else:
+                    temp = None
+            except Exception:
+                temp = None
+            try:
+                proc = min(len(psutil.pids()) / 1000.0, 1.0)
+            except Exception:
+                proc = None
+        except Exception:
+            cpu = mem = load1 = temp = proc = None
+    if cpu is None:
+        cpu = _cpu_percent_from_proc()
+    if mem is None:
+        mem = _mem_from_proc()
+    if load1 is None:
+        load1 = _load1_from_proc()
+    if proc is None:
+        proc = _proc_count_from_proc()
+    if temp is None:
+        temp = _read_temperature()
+    cpu = float(max(0.0, min(1.0, float(cpu or 0.0))))
+    mem = float(max(0.0, min(1.0, float(mem or 0.0))))
+    load1 = float(max(0.0, min(1.0, float(load1 or 0.0))))
+    proc = float(max(0.0, min(1.0, float(proc or 0.0))))
+    temp = float(max(0.0, min(1.0, float(temp or 0.0))))
+    return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
+
+def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
+    cpu = metrics.get("cpu", 0.1)
+    mem = metrics.get("mem", 0.1)
+    temp = metrics.get("temp", 0.1)
+    load1 = metrics.get("load1", 0.0)
+    proc = metrics.get("proc", 0.0)
+    r = cpu * (1.0 + load1)
+    g = mem * (1.0 + proc)
+    b = temp * (0.5 + cpu * 0.5)
+    maxi = max(r, g, b, 1.0)
+    r, g, b = r / maxi, g / maxi, b / maxi
+    return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
+
+def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
+    if qml is None or pnp is None:
+        r, g, b = rgb
+        seed = int((int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255))
+        random.seed(seed)
+        base = (0.3 * r + 0.4 * g + 0.3 * b)
+        noise = (random.random() - 0.5) * 0.08
+        return max(0.0, min(1.0, base + noise))
+    dev = qml.device("default.qubit", wires=2, shots=shots)
+    @qml.qnode(dev)
+    def circuit(a, b, c):
+        qml.RX(a * math.pi, wires=0)
+        qml.RY(b * math.pi, wires=1)
+        qml.CNOT(wires=[0, 1])
+        qml.RZ(c * math.pi, wires=1)
+        qml.RX((a + b) * math.pi / 2, wires=0)
+        qml.RY((b + c) * math.pi / 2, wires=1)
+        return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))
+    a, b, c = float(rgb[0]), float(rgb[1]), float(rgb[2])
+    try:
+        ev0, ev1 = circuit(a, b, c)
+        combined = ((ev0 + 1.0) / 2.0 * 0.6 + (ev1 + 1.0) / 2.0 * 0.4)
+        score = 1.0 / (1.0 + math.exp(-6.0 * (combined - 0.5)))
+        return float(max(0.0, min(1.0, score)))
+    except Exception:
+        return float(0.5 * (a + b + c) / 3.0)
+
+def entropic_summary_text(score: float) -> str:
+    if score >= 0.75:
+        level = "high"
+    elif score >= 0.45:
+        level = "medium"
+    else:
+        level = "low"
+    return f"entropic_score={score:.3f} (level={level})"
+
+def _simple_tokenize(text: str) -> List[str]:
+    return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
+
+def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
+    toks = _simple_tokenize(prompt_text)
+    freq: Dict[str, float] = {}
+    for t in toks:
+        freq[t] = freq.get(t, 0.0) + 1.0
+    hazard_boost = {
+        "ice": 2.0,
+        "wet": 1.8,
+        "snow": 2.0,
+        "flood": 2.0,
+        "construction": 1.8,
+        "pedestrian": 1.8,
+        "debris": 1.8,
+        "animal": 1.5,
+        "stall": 1.4,
+        "fog": 1.6,
+    }
+    scored: Dict[str, float] = {}
+    for t, c in freq.items():
+        boost = hazard_boost.get(t, 1.0)
+        scored[t] = c * boost
+    items = sorted(scored.items(), key=lambda x: -x[1])[:top_n]
+    if not items:
+        return {}
+    maxv = items[0][1]
+    return {k: float(v / maxv) for k, v in items}
+
+def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str = "balanced") -> Tuple[str, float]:
+    if not token_weights:
+        return prompt_text, 1.0
+    mean_weight = sum(token_weights.values()) / len(token_weights)
+    profile_map = {"conservative": 0.6, "balanced": 1.0, "aggressive": 1.4}
+    base = profile_map.get(profile, 1.0)
+    multiplier = 1.0 + (mean_weight - 0.5) * 0.8 * (base if base > 1.0 else 1.0)
+    multiplier = max(0.6, min(1.8, multiplier))
+    sorted_tokens = sorted(token_weights.items(), key=lambda x: -x[1])[:6]
+    markers = " ".join([f"<ATTN:{t}:{round(w,2)}>" for t, w in sorted_tokens])
+    patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
+    return patched, multiplier
+
+def chunked_generate(
+    llm,
+    prompt: str,
+    max_total_tokens: int = 256,
+    chunk_tokens: int = 64,
+    base_temperature: float = 0.2,
+    punkd_profile: str = "balanced",
+    streaming_callback: Optional[Callable[[str], None]] = None,
+) -> str:
+    assembled = ""
+    cur_prompt = prompt
+    token_weights = punkd_analyze(prompt, top_n=16)
+    iterations = max(1, (max_total_tokens + chunk_tokens - 1) // chunk_tokens)
+    prev_tail = ""
+    for _ in range(iterations):
+        patched_prompt, mult = punkd_apply(cur_prompt, token_weights, profile=punkd_profile)
+        temp = max(0.01, min(2.0, base_temperature * mult))
+        out = llm(patched_prompt, max_tokens=chunk_tokens, temperature=temp)
+        text = ""
+        if isinstance(out, dict):
+            try:
+                text = out.get("choices", [{"text": ""}])[0].get("text", "")
+            except Exception:
+                text = out.get("text", "")
+        else:
+            try:
+                text = str(out)
+            except Exception:
+                text = ""
+        text = (text or "").strip()
+        if not text:
+            break
+        overlap = 0
+        max_ol = min(30, len(prev_tail), len(text))
+        for olen in range(max_ol, 0, -1):
+            if prev_tail.endswith(text[:olen]):
+                overlap = olen
+                break
+        append_text = text[overlap:] if overlap else text
+        assembled += append_text
+        prev_tail = assembled[-120:] if len(assembled) > 120 else assembled
+        if streaming_callback:
+            streaming_callback(append_text)
+        m = re.search(r"\b(Low|Medium|High)\b", assembled, re.IGNORECASE)
+        if m:
+            break
+        if len(text.split()) < max(4, chunk_tokens // 8):
+            break
+        cur_prompt = prompt + "\n\nAssistant so far:\n" + assembled + "\n\nContinue:"
+    return assembled.strip()
+
+def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -> str:
+    entropy_text = "entropic_score=unknown"
+    if include_system_entropy:
+        metrics = collect_system_metrics()
+        rgb = metrics_to_rgb(metrics)
+        score = pennylane_entropic_score(rgb)
+        entropy_text = entropic_summary_text(score)
+        metrics_line = "sys_metrics: cpu={cpu:.2f},mem={mem:.2f},load={load1:.2f},temp={temp:.2f},proc={proc:.2f}".format(
+            cpu=metrics.get("cpu", 0.0),
+            mem=metrics.get("mem", 0.0),
+            load1=metrics.get("load1", 0.0),
+            temp=metrics.get("temp", 0.0),
+            proc=metrics.get("proc", 0.0),
+        )
+    else:
+        metrics_line = "sys_metrics: disabled"
+    return (
+        "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
+        "Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
+        "Your reply must be only one word: Low, Medium, or High.\n\n"
+        "[tuning]\n"
+        "Scene details:\n"
+        f"Location: {data.get('location','unspecified location')}\n"
+        f"Road type: {data.get('road_type','unknown')}\n"
+        f"Weather: {data.get('weather','unknown')}\n"
+        f"Traffic: {data.get('traffic','unknown')}\n"
+        f"Obstacles: {data.get('obstacles','none')}\n"
+        f"Sensor notes: {data.get('sensor_notes','none')}\n"
+        f"{metrics_line}\n"
+        f"Quantum State: {entropy_text}\n"
+        "[/tuning]\n\n"
+        "Follow these strict rules when forming your decision:\n"
+        "- Think through all scene factors internally but do not show reasoning.\n"
+        "- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
+        "- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
+        "- Choose only one risk level that best fits the entire situation.\n"
+        "- Output exactly one word, with no punctuation or labels.\n"
+        "- The valid outputs are only: Low, Medium, High.\n\n"
+        "[action]\n"
+        "1) Normalize sensor inputs to comparable scales.\n"
+        "3) Map environmental risk cues -> discrete label using conservative thresholds.\n"
+        "4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
+        "5) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
+        "6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
+        "[/action]\n\n"
+        "[replytemplate]\n"
+        "Low | Medium | High\n"
+        "[/replytemplate]"
     )
 
 def _heuristic_fallback(data: dict) -> str:
@@ -314,52 +667,40 @@ def _heuristic_fallback(data: dict) -> str:
         return "Medium"
     return "Low"
 
-def build_prompt(data: dict) -> str:
-    return (
-        "You are a road risk classifier.\n"
-        "Reply with ONLY one word: Low, Medium, or High.\n"
-        "Choose Low when conditions are normal/clear and traffic is low.\n"
-        "Choose High when visibility is poor, surface is hazardous, traffic is heavy, or obstacles exist.\n\n"
-        f"Location: {data.get('location','unspecified')}\n"
-        f"Road type: {data.get('road_type','unknown')}\n"
-        f"Weather: {data.get('weather','unknown')}\n"
-        f"Traffic: {data.get('traffic','unknown')}\n"
-        f"Obstacles: {data.get('obstacles','none')}\n"
-        f"Notes: {data.get('sensor_notes','none')}\n"
-    )
-
 def run_scan_blocking(data: dict) -> Tuple[str, str]:
-    prompt = build_prompt(data)
-    logger.info("SCAN: start")
+    prompt = build_road_scanner_prompt(data, include_system_entropy=True)
+    out_text = ""
     with acquire_plain_model() as mp:
-        logger.info("SCAN: model ready size_mb=%.1f", mp.stat().st_size / 1024 / 1024)
         llm = load_llama(mp)
-        logger.info("SCAN: inference call")
-        out = llm(prompt, max_tokens=16, temperature=0.2)
-        text = ""
-        if isinstance(out, dict):
+        try:
+            out_text = chunked_generate(
+                llm,
+                prompt,
+                max_total_tokens=96,
+                chunk_tokens=24,
+                base_temperature=0.18,
+                punkd_profile="balanced",
+                streaming_callback=None,
+            )
+        finally:
             try:
-                text = out.get("choices", [{"text": ""}])[0].get("text", "")
+                llm.close()
             except Exception:
-                text = ""
-        else:
-            text = str(out)
-        text = (text or "").strip()
-        try:
-            del llm
-        except Exception:
-            pass
-        try:
-            gc.collect()
-        except Exception:
-            pass
-        time.sleep(0.04)
-    m = re.search(r"\b(low|medium|high)\b", text, re.IGNORECASE)
+                pass
+            try:
+                del llm
+            except Exception:
+                pass
+            try:
+                gc.collect()
+            except Exception:
+                pass
+            time.sleep(0.03)
+    m = re.search(r"\b(low|medium|high)\b", out_text, re.IGNORECASE)
     label = m.group(1).capitalize() if m else ""
     if label not in ("Low", "Medium", "High"):
         label = _heuristic_fallback(data)
-    logger.info("SCAN: done label=%s raw=%s", label, text[:120].replace("\n", " "))
-    return label, text
+    return label, out_text
 
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.08, 0.10, 0.16, 1])
@@ -516,7 +857,7 @@ class RiskWheelNeo(Widget):
             Color(0.06, 0.07, 0.10, 0.92)
             RoundedRectangle(pos=(cx - dp(12), cy - dp(12)), size=(dp(24), dp(24)), radius=[dp(12)])
 
-KV = r"""
+KV_TEMPLATE = r"""
 #:import dp kivy.metrics.dp
 
 <BackgroundGradient>:
@@ -534,7 +875,7 @@ MDScreen:
         padding: 0, app.safe_top, 0, 0
         spacing: "0dp"
 
-        MDTopAppBar:
+        APPBAR_WIDGET:
             title: "Road Safe"
             elevation: 8
             right_action_items: [["information-outline", lambda x: app.switch_screen("about")], ["shield-lock-outline", lambda x: app.switch_screen("privacy")]]
@@ -925,7 +1266,7 @@ MDScreen:
                                     height: "22dp"
 
                                 MDLabel:
-                                    text: "Base directory: {}".format(app.base_dir_str)
+                                    text: "Base directory: " + app.base_dir_str
                                     halign: "left"
                                     theme_text_color: "Secondary"
                                     size_hint_y: None
@@ -1003,13 +1344,17 @@ MDScreen:
                 on_tab_press: app.switch_screen("debug")
 """
 
+KV = KV_TEMPLATE.replace("APPBAR_WIDGET", _APPBAR_NAME)
+
 def _is_first_boot() -> bool:
+    _require_paths()
     try:
         return not FIRST_BOOT_FLAG_PATH.exists()
     except Exception:
         return True
 
 def _mark_first_boot_done():
+    _require_paths()
     try:
         _atomic_write(FIRST_BOOT_FLAG_PATH, b"1")
     except Exception:
@@ -1020,15 +1365,47 @@ class SecureLLMApp(MDApp):
     safe_top = NumericProperty(0)
     _scan_lock = threading.Lock()
     _scan_inflight = False
-    base_dir_str = StringProperty(str(BASE_DIR))
+    base_dir_str = StringProperty("")
+    _exec: Optional[ThreadPoolExecutor] = None
+
+    def _init_paths(self):
+        global BASE_DIR, TMP_DIR, INSTALL_MASTER_PATH, INSTALL_MDK_WRAP_PATH, FIRST_BOOT_FLAG_PATH, LOG_PATH
+        ud = Path(self.user_data_dir)
+        BASE_DIR = ud / "qroadscan_data"
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        TMP_DIR = BASE_DIR / "tmp"
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        INSTALL_MASTER_PATH = BASE_DIR / ".install_master_key"
+        INSTALL_MDK_WRAP_PATH = BASE_DIR / ".mdk.wrap.install"
+        FIRST_BOOT_FLAG_PATH = BASE_DIR / ".first_boot_done"
+        LOG_PATH = BASE_DIR / "debug.log"
+        self.base_dir_str = str(BASE_DIR)
+
+    def _cleanup_tmp(self):
+        try:
+            _require_paths()
+            if TMP_DIR is None or not TMP_DIR.exists():
+                return
+            for p in TMP_DIR.glob("model_plain.*.gguf"):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def build(self):
         self.title = "Road Safe"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Blue"
         self.safe_top = dp(24) if _kivy_platform == "android" else 0
+        self._init_paths()
+        self._cleanup_tmp()
+        self._exec = ThreadPoolExecutor(max_workers=1)
         return Builder.load_string(KV)
+
     def on_start(self):
-        logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
+        logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR) if BASE_DIR else "—")
         logger.info("pkg=%s shipped_models=%s", str(PKG_DIR), str(MODELS_SHIPPED))
         logger.info("model_enc=%s boot_wrap=%s sha=%s", str(MODEL_ENC_PATH), str(MODEL_BOOT_WRAP_PATH), str(MODEL_SHA_PATH))
         try:
@@ -1038,8 +1415,16 @@ class SecureLLMApp(MDApp):
             logger.exception("LLAMA: module import FAILED: %s", e)
         Clock.schedule_once(lambda dt: self.reset_ui(), 0.0)
         Clock.schedule_once(lambda dt: self.gui_debug_refresh(), 0.2)
-        Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.6)
+        Clock.schedule_interval(self._debug_auto_refresh, 0.6)
         Clock.schedule_once(lambda dt: self._route_first_boot(), 0.0)
+
+    def on_stop(self):
+        try:
+            if self._exec:
+                self._exec.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
     def _route_first_boot(self):
         try:
             if _is_first_boot():
@@ -1048,9 +1433,11 @@ class SecureLLMApp(MDApp):
                 self.switch_screen("road")
         except Exception:
             self.switch_screen("road")
+
     def accept_about(self):
         _mark_first_boot_done()
         self.switch_screen("road")
+
     def _debug_auto_refresh(self, *args):
         try:
             if self.root.ids.screen_manager.current == "debug" or self._debug_dirty:
@@ -1058,6 +1445,7 @@ class SecureLLMApp(MDApp):
                 self.gui_debug_refresh()
         except Exception:
             pass
+
     def switch_screen(self, name: str):
         try:
             self.root.ids.screen_manager.current = name
@@ -1065,6 +1453,7 @@ class SecureLLMApp(MDApp):
             pass
         if name == "debug":
             self.gui_debug_refresh()
+
     def _pill(self, tone: str, text: str):
         try:
             road = self.root.ids.screen_manager.get_screen("road")
@@ -1072,6 +1461,7 @@ class SecureLLMApp(MDApp):
             road.ids.status_pill_text.text = text
         except Exception:
             pass
+
     def reset_ui(self):
         try:
             road = self.root.ids.screen_manager.get_screen("road")
@@ -1084,8 +1474,9 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
         self._scan_inflight = False
+
     def on_scan(self):
-        if self._scan_inflight:
+        if self._scan_inflight or self._exec is None:
             return
         with self._scan_lock:
             if self._scan_inflight:
@@ -1102,7 +1493,7 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
         data = {
-            "location": (road.ids.loc_field.text or "").strip() or "unspecified",
+            "location": (road.ids.loc_field.text or "").strip() or "unspecified location",
             "road_type": "unknown",
             "weather": "unknown",
             "traffic": "unknown",
@@ -1111,14 +1502,17 @@ class SecureLLMApp(MDApp):
         }
         scan_id = uuid.uuid4().hex[:10]
         logger.info("SCAN_UI: clicked id=%s", scan_id)
-        threading.Thread(target=self._scan_worker, args=(data, scan_id), daemon=True).start()
-    def _scan_worker(self, data: dict, scan_id: str):
+        fut = self._exec.submit(run_scan_blocking, data)
+        fut.add_done_callback(lambda f: self._scan_done_callback(f, scan_id))
+
+    def _scan_done_callback(self, fut, scan_id: str):
         try:
-            label, raw = run_scan_blocking(data)
+            label, raw = fut.result()
         except Exception as e:
             logger.exception("SCAN: failed id=%s", scan_id)
             label, raw = "", f"[Error] {e}"
         Clock.schedule_once(lambda dt: self._scan_finish(label, raw, scan_id), 0)
+
     def _scan_finish(self, label: str, raw: str, scan_id: str):
         road = self.root.ids.screen_manager.get_screen("road")
         lvl = (label or "").strip().capitalize()
@@ -1144,17 +1538,19 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
         self._scan_inflight = False
-        logger.info("SCAN_UI: done id=%s label=%s raw=%s", scan_id, lvl, (raw or "")[:180].replace("\n", " "))
+        logger.info("SCAN_UI: done id=%s label=%s raw=%s", scan_id, lvl, (raw or "")[:220].replace("\n", " "))
+
     def gui_debug_refresh(self):
         try:
-            meta = f"file={'YES' if LOG_PATH.exists() else 'no'} | path={str(LOG_PATH)}"
+            meta = f"file={'YES' if (LOG_PATH and LOG_PATH.exists()) else 'no'} | path={str(LOG_PATH) if LOG_PATH else '—'}"
             self.root.ids.debug_meta.text = meta
             self.root.ids.debug_text.text = _read_log_tail()
         except Exception:
             pass
+
     def gui_debug_clear(self):
         try:
-            if LOG_PATH.exists():
+            if LOG_PATH and LOG_PATH.exists():
                 LOG_PATH.unlink()
         except Exception:
             pass
@@ -1162,3 +1558,4 @@ class SecureLLMApp(MDApp):
 
 if __name__ == "__main__":
     SecureLLMApp().run()
+```0

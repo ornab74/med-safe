@@ -11,15 +11,15 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # Install SDK in HOME to avoid permission issues.
-      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
-      ANDROID_HOME: ${{ runner.temp }}/android-sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROIDSDK: /usr/local/lib/android/sdk
 
       # ===== Model (build-time only) =====
       MODEL_URL: https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
       MODEL_FILENAME: llama3-small-Q3_K_M.gguf
 
-      # ✅ Expected SHA256 of plaintext GGUF download
+      # ✅ Hardcoded expected SHA256 of the plaintext GGUF you download
       MODEL_SHA256_EXPECTED: 8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
 
     steps:
@@ -53,23 +53,22 @@ jobs:
           rm tools.zip
           mv cmdline-tools latest
 
-          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          # ✅ Create legacy tools/bin path expected by older p4a/buildozer checks
+          mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
+          ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
 
-      - name: Install Android packages (API 35 + Build-Tools 35.0.0)
+          # Put both on PATH
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
+
+      - name: Install Android packages (API 35)
         run: |
           sdkmanager --version
-          yes | sdkmanager --licenses
-
+          yes | sdkmanager --licenses || true
           sdkmanager \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
-
-          echo "Verify build-tools installed:"
-          ls -lah "$ANDROID_SDK_ROOT/build-tools/35.0.0" || true
-
-          echo "Verify aidl exists:"
-          test -x "$ANDROID_SDK_ROOT/build-tools/35.0.0/aidl" || (echo "ERROR: aidl missing" && exit 1)
 
       - name: Install Buildozer & Python deps (host)
         run: |
@@ -99,30 +98,6 @@ jobs:
             exit 1
           fi
           echo "SHA256 OK"
-
-      # Optional: inject bootstrap_secret.py into app source so runtime doesn't need env vars.
-      - name: Inject bootstrap_secret.py (runtime uses this)
-        env:
-          BOOTSTRAP_SECRET: ${{ secrets.BOOTSTRAP_SECRET }}
-        run: |
-          if [ -z "$BOOTSTRAP_SECRET" ]; then
-            echo "ERROR: Missing secrets.BOOTSTRAP_SECRET"
-            exit 1
-          fi
-
-          python - <<'PY'
-          import os, base64, textwrap
-          s = os.environ["BOOTSTRAP_SECRET"].encode("utf-8")
-          b64 = base64.b64encode(s).decode("ascii")
-          content = f"""# Auto-generated at build time (GitHub Actions)
-          import base64
-          BOOTSTRAP_SECRET_B64 = {b64!r}
-          def get_secret_bytes() -> bytes:
-              return base64.b64decode(BOOTSTRAP_SECRET_B64.encode("ascii"))
-          """
-          open("bootstrap_secret.py", "w", encoding="utf-8").write(textwrap.dedent(content))
-          print("Wrote bootstrap_secret.py")
-          PY
 
       - name: Encrypt model + create wrapped MDK (no runtime internet needed)
         env:
@@ -261,4 +236,3 @@ jobs:
           name: QRS-Android-APK
           path: bin/*.apk
           if-no-files-found: error
-

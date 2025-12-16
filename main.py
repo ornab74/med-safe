@@ -1,5 +1,18 @@
+import os
+import sys
+import time
+import json
+import hashlib
+import asyncio
+import threading
+import httpx
+import aiosqlite
+import math
+import random
+import re
+import uuid
+import logging
 
-import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, List, Tuple, Callable, Dict
@@ -36,7 +49,6 @@ from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.uix.widget import Widget
 from kivy.uix.screenmanager import ScreenManager
-from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
 from kivy.properties import NumericProperty, StringProperty, ListProperty
@@ -45,7 +57,7 @@ from kivy.utils import platform as _kivy_platform
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton, MDRaisedButton
-from kivymd.uix.list import TwoLineListItem, MDList
+from kivymd.uix.list import TwoLineListItem
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.progressbar import MDProgressBar
@@ -53,6 +65,7 @@ from kivymd.uix.toolbar import MDTopAppBar
 from kivymd.uix.label import MDLabel
 from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
 from kivymd.uix.screen import MDScreen
+
 
 if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 760)
@@ -76,39 +89,71 @@ def _is_writable_dir(p: Path) -> bool:
         return False
 
 
-def _android_files_dir() -> Optional[Path]:
+# ----------------------------
+# ANDROID STORAGE (FIXED)
+# ----------------------------
+def _android_context():
     if _kivy_platform != "android" or autoclass is None:
         return None
     try:
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        activity = PythonActivity.mActivity
-        d = activity.getFilesDir().getAbsolutePath()
-        return Path(str(d))
+        return PythonActivity.mActivity
+    except Exception:
+        return None
+
+
+def _android_files_dir() -> Optional[Path]:
+    ctx = _android_context()
+    if not ctx:
+        return None
+    try:
+        return Path(str(ctx.getFilesDir().getAbsolutePath()))
+    except Exception:
+        return None
+
+
+def _android_external_files_dir() -> Optional[Path]:
+    ctx = _android_context()
+    if not ctx:
+        return None
+    try:
+        ext = ctx.getExternalFilesDir(None)  # app-scoped external (no permission)
+        if ext is None:
+            return None
+        return Path(str(ext.getAbsolutePath()))
     except Exception:
         return None
 
 
 def _app_base_dir() -> Path:
-    p = os.environ.get("ANDROID_PRIVATE")
-    if p:
-        base = Path(p)
-        d = base / "qroadscan_data"
-        if _is_writable_dir(d):
+    # Android: NEVER fall back to __file__/APK paths (read-only).
+    if _kivy_platform == "android":
+        # Prefer app-scoped external for big files if available, otherwise internal.
+        ext = _android_external_files_dir()
+        if ext:
+            d = ext / "qroadscan_data"
+            if _is_writable_dir(d):
+                return d
+
+        internal = _android_files_dir()
+        if internal:
+            d = internal / "qroadscan_data"
+            d.mkdir(parents=True, exist_ok=True)
             return d
 
-    p2 = os.environ.get("ANDROID_APP_PATH")
-    if p2:
-        base = Path(p2)
-        d = base / "qroadscan_data"
-        if _is_writable_dir(d):
+        # last-resort: whatever p4a exposes (should still be internal)
+        p = os.environ.get("ANDROID_PRIVATE")
+        if p:
+            d = Path(p) / "qroadscan_data"
+            d.mkdir(parents=True, exist_ok=True)
             return d
 
-    af = _android_files_dir()
-    if af:
-        d = af / "qroadscan_data"
-        if _is_writable_dir(d):
-            return d
+        # If we got here, something is wrong with runtime environment.
+        d = Path.cwd() / "qroadscan_data"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
+    # Non-Android (desktop/dev)
     base = Path(__file__).resolve().parent
     d = base / "qroadscan_data"
     d.mkdir(parents=True, exist_ok=True)
@@ -121,14 +166,15 @@ MODEL_REPO = "https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/
 MODEL_FILE = "llama3-small-Q3_K_M.gguf"
 EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
 
-MODELS_DIR = (BASE_DIR / "models")
+MODELS_DIR = BASE_DIR / "models"
 MODEL_PATH = MODELS_DIR / MODEL_FILE
 ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
 
-DB_PATH = (BASE_DIR / "chat_history.db.aes")
-KEY_PATH = (BASE_DIR / ".enc_key_wrapped")
-LOG_PATH = (BASE_DIR / "debug.log")
-TMP_DIR = (BASE_DIR / "tmp")
+DB_PATH = BASE_DIR / "chat_history.db.aes"
+KEY_PATH = BASE_DIR / ".enc_key_wrapped"
+LOG_PATH = BASE_DIR / "debug.log"
+TMP_DIR = BASE_DIR / "tmp"
+
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -136,7 +182,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 class _RingLog:
     def __init__(self, max_lines=600):
         self.max_lines = int(max_lines)
-        self._lines = []
+        self._lines: List[str] = []
         self._lock = RLock()
 
     def add(self, line: str):
@@ -196,7 +242,10 @@ if not any(isinstance(h, _FileAndRingHandler) for h in logger.handlers):
 
 
 def _atomic_write_bytes(path: Path, data: bytes):
-    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}")
+    tmp = path.with_suffix(
+        path.suffix
+        + f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    )
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_bytes(data)
     tmp.replace(path)
@@ -286,9 +335,12 @@ def _android_keystore_ensure_rsa(alias: str):
     ks = _android_keystore_get()
     if ks.containsAlias(alias):
         return
+
     KeyPairGenerator = autoclass("java.security.KeyPairGenerator")
     KeyProperties = autoclass("android.security.keystore.KeyProperties")
-    KeyGenParameterSpecBuilder = autoclass("android.security.keystore.KeyGenParameterSpec$Builder")
+    KeyGenParameterSpecBuilder = autoclass(
+        "android.security.keystore.KeyGenParameterSpec$Builder"
+    )
     purposes = int(KeyProperties.PURPOSE_ENCRYPT) | int(KeyProperties.PURPOSE_DECRYPT)
     builder = KeyGenParameterSpecBuilder(alias, purposes)
     builder.setDigests([KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512])
@@ -345,6 +397,7 @@ def _load_wrapped_key() -> Optional[bytes]:
         except Exception:
             logger.exception("key unwrap failed")
             return None
+
     k = d[:32] if len(d) >= 32 else None
     if k:
         logger.info("key loaded: file raw (non-android)")
@@ -368,7 +421,12 @@ def get_or_create_key() -> bytes:
 def derive_key_from_passphrase(pw: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
     if salt is None:
         salt = os.urandom(16)
-    kdf_der = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000)
+    kdf_der = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=200_000,
+    )
     derived = kdf_der.derive(pw.encode("utf-8"))
     return salt, derived
 
@@ -434,6 +492,7 @@ def decrypt_file(src: Path, dest: Path, key: bytes, chunk_size: int = 1024 * 102
             fin.seek(tag_pos)
             tag = fin.read(16)
             fin.seek(12)
+
             dec = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
             tmp = dest.with_suffix(dest.suffix + f".dec.{uuid.uuid4().hex}")
             with tmp.open("wb") as fout:
@@ -700,6 +759,7 @@ def collect_system_metrics() -> Dict[str, float]:
                 load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_cnt))))
             except Exception:
                 load1 = None
+
             try:
                 temps_map = psutil.sensors_temperatures()
                 if temps_map:
@@ -709,6 +769,7 @@ def collect_system_metrics() -> Dict[str, float]:
                     temp = None
             except Exception:
                 temp = None
+
             try:
                 proc = min(len(psutil.pids()) / 1000.0, 1.0)
             except Exception:
@@ -732,6 +793,7 @@ def collect_system_metrics() -> Dict[str, float]:
     load1 = float(max(0.0, min(1.0, float(load1 or 0.0))))
     proc = float(max(0.0, min(1.0, float(proc or 0.0))))
     temp = float(max(0.0, min(1.0, float(temp or 0.0))))
+
     return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
 
 
@@ -748,7 +810,11 @@ def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
 
     maxi = max(r, g, b, 1.0)
     r, g, b = r / maxi, g / maxi, b / maxi
-    return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
+    return (
+        float(max(0.0, min(1.0, r))),
+        float(max(0.0, min(1.0, g))),
+        float(max(0.0, min(1.0, b))),
+    )
 
 
 def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
@@ -793,12 +859,12 @@ def entropic_summary_text(score: float) -> str:
 
 
 def _simple_tokenize(text: str) -> List[str]:
-    return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
+    return [t for t in re.findall(r"[A-Za-z0-9_\-]+", (text or "").lower())]
 
 
 def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
     toks = _simple_tokenize(prompt_text)
-    freq = {}
+    freq: Dict[str, float] = {}
     for t in toks:
         freq[t] = freq.get(t, 0) + 1
 
@@ -814,7 +880,7 @@ def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
         "stall": 1.4,
         "fog": 1.6,
     }
-    scored = {}
+    scored: Dict[str, float] = {}
     for t, c in freq.items():
         boost = hazard_boost.get(t, 1.0)
         scored[t] = c * boost
@@ -834,6 +900,7 @@ def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str 
     base = profile_map.get(profile, 1.0)
     multiplier = 1.0 + (mean_weight - 0.5) * 0.8 * (base if base > 1.0 else 1.0)
     multiplier = max(0.6, min(1.8, multiplier))
+
     sorted_tokens = sorted(token_weights.items(), key=lambda x: -x[1])[:6]
     markers = " ".join([f"<ATTN:{t}:{round(w,2)}>" for t, w in sorted_tokens])
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
@@ -1015,7 +1082,10 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                     )
 
                 result = await loop.run_in_executor(ex, run_chunked)
-                text = (result or "").strip().replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "")
+                text = (result or "").strip().replace(
+                    "You are a helpful AI assistant named SmolLM, trained by Hugging Face", ""
+                )
+
                 candidate = text.split()
                 label = candidate[0].capitalize() if candidate else ""
 
@@ -1045,6 +1115,9 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
         return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]"
 
 
+# ----------------------------
+# UI WIDGETS (NO ANIMATIONS)
+# ----------------------------
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.07, 0.09, 0.14, 1])
     bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
@@ -1052,7 +1125,9 @@ class BackgroundGradient(Widget):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
+        self.bind(pos=self._redraw, size=self._redraw,
+                  top_color=self._redraw, bottom_color=self._redraw,
+                  steps=self._redraw)
 
     def _lerp(self, a, b, t):
         return a + (b - a) * t
@@ -1078,30 +1153,12 @@ class GlassCard(Widget):
     fill = ListProperty([1, 1, 1, 0.055])
     border = ListProperty([1, 1, 1, 0.13])
     highlight = ListProperty([1, 1, 1, 0.08])
-    _shine_x = NumericProperty(0.0)
-    _shine_alpha = NumericProperty(0.0)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.bind(
-            pos=self._redraw,
-            size=self._redraw,
-            radius=self._redraw,
-            fill=self._redraw,
-            border=self._redraw,
-            highlight=self._redraw,
-            _shine_x=self._redraw,
-            _shine_alpha=self._redraw,
-        )
-
-    def _start_shine(self):
-        self._shine_x = -0.3
-        self._shine_alpha = 0.0
-        anim = (Animation(_shine_alpha=0.22, duration=0.45, t="out_quad") & Animation(_shine_x=1.3, duration=1.1, t="out_cubic"))
-        anim2 = Animation(_shine_alpha=0.0, duration=0.40, t="out_quad")
-        loop = (anim + anim2)
-        loop.repeat = True
-        loop.start(self)
+        self.bind(pos=self._redraw, size=self._redraw,
+                  radius=self._redraw, fill=self._redraw,
+                  border=self._redraw, highlight=self._redraw)
 
     def _redraw(self, *args):
         self.canvas.clear()
@@ -1117,43 +1174,27 @@ class GlassCard(Widget):
             RoundedRectangle(pos=(x + dp(1), y + h * 0.55), size=(w - dp(2), h * 0.45), radius=[r])
             Color(*self.border)
             Line(rounded_rectangle=[x, y, w, h, r], width=dp(1.1))
-            if self._shine_alpha > 0.001:
-                sx = x + w * self._shine_x
-                Color(1, 1, 1, float(self._shine_alpha))
-                Rectangle(pos=(sx, y), size=(w * 0.18, h))
 
 
 class RiskWheelNeo(Widget):
     value = NumericProperty(0.5)
     level = StringProperty("MEDIUM")
-    sweep = NumericProperty(0.0)
-    glow = NumericProperty(0.25)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, sweep=self._redraw, glow=self._redraw, level=self._redraw)
-
-    def _start_sweep(self):
-        a = Animation(sweep=1.0, duration=2.2, t="linear")
-        a.repeat = True
-        a.start(self)
-        anim = Animation(glow=0.42, duration=0.9, t="in_out_quad") + Animation(glow=0.22, duration=0.9, t="in_out_quad")
-        anim.repeat = True
-        anim.start(self)
+        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, level=self._redraw)
 
     def set_level(self, level: str):
         lvl = (level or "").strip().upper()
         if lvl.startswith("LOW"):
-            target = 0.0
             self.level = "LOW"
+            self.value = 0.0
         elif lvl.startswith("HIGH"):
-            target = 1.0
             self.level = "HIGH"
+            self.value = 1.0
         else:
-            target = 0.5
             self.level = "MEDIUM"
-        Animation.cancel_all(self, "value")
-        Animation(value=target, duration=0.55, t="out_cubic").start(self)
+            self.value = 0.5
 
     def _level_color(self):
         if self.level == "LOW":
@@ -1167,44 +1208,37 @@ class RiskWheelNeo(Widget):
         cx, cy = self.center
         r = min(self.width, self.height) * 0.41
         thickness = max(dp(12), r * 0.16)
+
         ang = -135.0 + 270.0 * float(self.value)
         ang_rad = math.radians(ang)
-        sweep_ang = -135.0 + 270.0 * float(self.sweep)
-        sweep_width = 18.0
         active_rgb = self._level_color()
-        pulse = float(self.glow)
+
         segs = [
             ("LOW", (0.10, 0.85, 0.40), -135.0, -45.0),
             ("MED", (0.98, 0.78, 0.20), -45.0, 45.0),
             ("HIGH", (0.98, 0.22, 0.30), 45.0, 135.0),
         ]
         gap = 6.0
+
         with self.canvas:
             Color(1, 1, 1, 0.05)
             Line(circle=(cx, cy, r + dp(10), -140, 140), width=dp(1.2))
             Color(0.10, 0.12, 0.18, 0.65)
             Line(circle=(cx, cy, r, -140, 140), width=thickness, cap="round")
+
             for name, rgb, a0, a1 in segs:
                 a0g = a0 + gap / 2.0
                 a1g = a1 - gap / 2.0
-                active = (self.level == "LOW" and name == "LOW") or (self.level == "MEDIUM" and name == "MED") or (self.level == "HIGH" and name == "HIGH")
-                boost = 1.0 + (0.85 * pulse if active else 0.0)
-                for k in range(5, 0, -1):
-                    alpha = (0.05 + 0.03 * k) * boost
-                    Color(rgb[0], rgb[1], rgb[2], alpha)
-                    Line(circle=(cx, cy, r, a0g, a1g), width=thickness + dp(2.6 * k), cap="round")
                 Color(rgb[0], rgb[1], rgb[2], 0.78)
                 Line(circle=(cx, cy, r, a0g, a1g), width=thickness, cap="round")
-            Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.22 + 0.18 * pulse)
-            Line(circle=(cx, cy, r, sweep_ang - sweep_width / 2.0, sweep_ang + sweep_width / 2.0), width=thickness + dp(6), cap="round")
-            Color(1, 1, 1, 0.12)
-            Line(circle=(cx, cy, r, sweep_ang - sweep_width / 5.0, sweep_ang + sweep_width / 5.0), width=thickness - dp(2), cap="round")
+
             nx = cx + math.cos(ang_rad) * (r * 0.92)
             ny = cy + math.sin(ang_rad) * (r * 0.92)
-            Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.18 + 0.18 * pulse)
+            Color(active_rgb[0], active_rgb[1], active_rgb[2], 0.22)
             Line(points=[cx, cy, nx, ny], width=max(dp(3.2), thickness * 0.16), cap="round")
             Color(0.97, 0.97, 0.99, 0.98)
             Line(points=[cx, cy, nx, ny], width=max(dp(2), thickness * 0.10), cap="round")
+
             Color(1, 1, 1, 0.08)
             RoundedRectangle(pos=(cx - dp(18), cy - dp(18)), size=(dp(36), dp(36)), radius=[dp(18)])
             Color(1, 1, 1, 0.18)
@@ -1216,23 +1250,28 @@ class RiskWheelNeo(Widget):
 KV = r"""
 <BackgroundGradient>:
     size_hint: 1, 1
+
 <GlassCard>:
     size_hint: 1, None
+
 <RiskWheelNeo>:
     size_hint: None, None
 
 MDScreen:
     MDBoxLayout:
         orientation: "vertical"
+
         MDTopAppBar:
             title: "Road Safe"
             elevation: 10
+
         MDLabel:
             id: status_label
             text: ""
             size_hint_y: None
             height: "24dp"
             halign: "center"
+
         ScreenManager:
             id: screen_manager
             size_hint_y: 1
@@ -1242,16 +1281,20 @@ MDScreen:
                 BackgroundGradient:
                     top_color: 0.07, 0.09, 0.14, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
+
                 MDBoxLayout:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
+
                     ScrollView:
                         do_scroll_x: False
+
                         FloatLayout:
                             size_hint_x: 1
                             size_hint_y: None
                             height: max(content.minimum_height, self.parent.height)
+
                             GlassCard:
                                 pos: self.parent.pos
                                 size: self.parent.size
@@ -1259,6 +1302,7 @@ MDScreen:
                                 fill: 1, 1, 1, 0.055
                                 border: 1, 1, 1, 0.13
                                 highlight: 1, 1, 1, 0.08
+
                             MDBoxLayout:
                                 id: content
                                 orientation: "vertical"
@@ -1270,6 +1314,7 @@ MDScreen:
                                 y: self.parent.y
                                 padding: "14dp"
                                 spacing: "10dp"
+
                                 MDLabel:
                                     text: "Road Risk Scanner"
                                     bold: True
@@ -1277,6 +1322,7 @@ MDScreen:
                                     halign: "center"
                                     size_hint_y: None
                                     height: "32dp"
+
                                 MDBoxLayout:
                                     size_hint_y: None
                                     height: "250dp"
@@ -1285,40 +1331,49 @@ MDScreen:
                                         id: risk_wheel
                                         size: "240dp", "240dp"
                                         pos_hint: {"center_x": 0.5, "center_y": 0.55}
+
                                 MDLabel:
                                     id: risk_text
                                     text: "RISK: —"
                                     halign: "center"
                                     size_hint_y: None
                                     height: "22dp"
+
                                 MDTextField:
                                     id: loc_field
                                     hint_text: "Location (e.g., I-95 NB mile 12)"
                                     mode: "fill"
+
                                 MDTextField:
                                     id: road_type_field
                                     hint_text: "Road type (highway/urban/residential)"
                                     mode: "fill"
+
                                 MDTextField:
                                     id: weather_field
                                     hint_text: "Weather/visibility"
                                     mode: "fill"
+
                                 MDTextField:
                                     id: traffic_field
                                     hint_text: "Traffic density (low/med/high)"
                                     mode: "fill"
+
                                 MDTextField:
                                     id: obstacles_field
                                     hint_text: "Reported obstacles"
                                     mode: "fill"
+
                                 MDTextField:
                                     id: sensor_notes_field
                                     hint_text: "Sensor notes"
                                     mode: "fill"
+
                                 MDRaisedButton:
                                     text: "Scan Risk"
                                     size_hint_x: 1
                                     on_release: app.on_scan()
+
                                 MDLabel:
                                     id: scan_result
                                     text: ""
@@ -1331,10 +1386,12 @@ MDScreen:
                 BackgroundGradient:
                     top_color: 0.06, 0.08, 0.13, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
+
                 MDBoxLayout:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
+
                     FloatLayout:
                         GlassCard:
                             pos: self.parent.pos
@@ -1344,49 +1401,61 @@ MDScreen:
                             fill: 1, 1, 1, 0.05
                             border: 1, 1, 1, 0.12
                             highlight: 1, 1, 1, 0.07
+
                         MDBoxLayout:
                             orientation: "vertical"
                             padding: "14dp"
                             spacing: "10dp"
                             pos: self.parent.pos
                             size: self.parent.size
+
                             MDLabel:
                                 text: "Model Manager"
                                 bold: True
                                 font_style: "H6"
                                 size_hint_y: None
                                 height: "32dp"
+
                             MDLabel:
                                 id: model_status
                                 text: "—"
                                 theme_text_color: "Secondary"
+
                             MDProgressBar:
                                 id: model_progress
                                 value: 0
                                 max: 100
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
+
                                 MDRaisedButton:
                                     text: "Download"
                                     on_release: app.gui_model_download()
+
                                 MDRaisedButton:
                                     text: "Verify SHA"
                                     on_release: app.gui_model_verify()
+
                                 MDRaisedButton:
                                     text: "Encrypt"
                                     on_release: app.gui_model_encrypt()
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
+
                                 MDRaisedButton:
                                     text: "Decrypt"
                                     on_release: app.gui_model_decrypt()
+
                                 MDRaisedButton:
                                     text: "Delete plain"
                                     on_release: app.gui_model_delete_plain()
+
                                 MDRaisedButton:
                                     text: "Refresh"
                                     on_release: app.gui_model_refresh()
@@ -1396,10 +1465,12 @@ MDScreen:
                 BackgroundGradient:
                     top_color: 0.06, 0.08, 0.13, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
+
                 MDBoxLayout:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
+
                     FloatLayout:
                         GlassCard:
                             pos: self.parent.pos
@@ -1409,51 +1480,63 @@ MDScreen:
                             fill: 1, 1, 1, 0.05
                             border: 1, 1, 1, 0.12
                             highlight: 1, 1, 1, 0.07
+
                         MDBoxLayout:
                             orientation: "vertical"
                             padding: "14dp"
                             spacing: "10dp"
                             pos: self.parent.pos
                             size: self.parent.size
+
                             MDLabel:
                                 text: "History"
                                 bold: True
                                 font_style: "H6"
                                 size_hint_y: None
                                 height: "32dp"
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "48dp"
+
                                 MDTextField:
                                     id: history_search
                                     hint_text: "Search prompt/response"
                                     mode: "fill"
+
                                 MDRaisedButton:
                                     text: "Search"
                                     on_release: app.gui_history_search()
+
                                 MDRaisedButton:
                                     text: "Clear"
                                     on_release: app.gui_history_clear()
+
                             MDLabel:
                                 id: history_meta
                                 text: "—"
                                 theme_text_color: "Secondary"
                                 size_hint_y: None
                                 height: "22dp"
+
                             ScrollView:
                                 MDList:
                                     id: history_list
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
+
                                 MDRaisedButton:
                                     text: "Prev"
                                     on_release: app.gui_history_prev()
+
                                 MDRaisedButton:
                                     text: "Next"
                                     on_release: app.gui_history_next()
+
                                 MDRaisedButton:
                                     text: "Refresh"
                                     on_release: app.gui_history_refresh()
@@ -1463,10 +1546,12 @@ MDScreen:
                 BackgroundGradient:
                     top_color: 0.06, 0.08, 0.13, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
+
                 MDBoxLayout:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
+
                     FloatLayout:
                         GlassCard:
                             pos: self.parent.pos
@@ -1476,35 +1561,43 @@ MDScreen:
                             fill: 1, 1, 1, 0.05
                             border: 1, 1, 1, 0.12
                             highlight: 1, 1, 1, 0.07
+
                         MDBoxLayout:
                             orientation: "vertical"
                             padding: "14dp"
                             spacing: "10dp"
                             pos: self.parent.pos
                             size: self.parent.size
+
                             MDLabel:
                                 text: "Security"
                                 bold: True
                                 font_style: "H6"
                                 size_hint_y: None
                                 height: "32dp"
+
                             MDLabel:
                                 text: "Rotate the encryption key and re-encrypt model + DB."
                                 theme_text_color: "Secondary"
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
+
                                 MDRaisedButton:
                                     text: "New random key"
                                     on_release: app.gui_rekey_random()
+
                                 MDRaisedButton:
                                     text: "Passphrase key"
                                     on_release: app.gui_rekey_passphrase_dialog()
+
                             MDProgressBar:
                                 id: rekey_progress
                                 value: 0
                                 max: 100
+
                             MDLabel:
                                 id: rekey_status
                                 text: "—"
@@ -1515,10 +1608,12 @@ MDScreen:
                 BackgroundGradient:
                     top_color: 0.06, 0.08, 0.13, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
+
                 MDBoxLayout:
                     orientation: "vertical"
                     padding: "10dp"
                     spacing: "10dp"
+
                     FloatLayout:
                         GlassCard:
                             pos: self.parent.pos
@@ -1528,37 +1623,45 @@ MDScreen:
                             fill: 1, 1, 1, 0.05
                             border: 1, 1, 1, 0.12
                             highlight: 1, 1, 1, 0.07
+
                         MDBoxLayout:
                             orientation: "vertical"
                             padding: "14dp"
                             spacing: "10dp"
                             pos: self.parent.pos
                             size: self.parent.size
+
                             MDLabel:
                                 text: "Debug Log"
                                 bold: True
                                 font_style: "H6"
                                 size_hint_y: None
                                 height: "32dp"
+
                             MDLabel:
                                 id: debug_meta
                                 text: "—"
                                 theme_text_color: "Secondary"
                                 size_hint_y: None
                                 height: "22dp"
+
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
+
                                 MDRaisedButton:
                                     text: "Refresh"
                                     on_release: app.gui_debug_refresh()
+
                                 MDRaisedButton:
                                     text: "Clear"
                                     on_release: app.gui_debug_clear()
+
                                 MDRaisedButton:
                                     text: "Emit test"
                                     on_release: app.gui_debug_emit_test()
+
                             ScrollView:
                                 MDLabel:
                                     id: debug_text
@@ -1571,26 +1674,31 @@ MDScreen:
             size_hint_y: None
             height: "72dp"
             panel_color: 0.08,0.09,0.12,1
+
             MDBottomNavigationItem:
                 name: "nav_road"
                 text: "Road"
                 icon: "road-variant"
                 on_tab_press: app.switch_screen("road")
+
             MDBottomNavigationItem:
                 name: "nav_model"
                 text: "Model"
                 icon: "cube-outline"
                 on_tab_press: app.switch_screen("model")
+
             MDBottomNavigationItem:
                 name: "nav_history"
                 text: "History"
                 icon: "history"
                 on_tab_press: app.switch_screen("history")
+
             MDBottomNavigationItem:
                 name: "nav_security"
                 text: "Security"
                 icon: "shield-lock-outline"
                 on_tab_press: app.switch_screen("security")
+
             MDBottomNavigationItem:
                 name: "nav_debug"
                 text: "Debug"
@@ -1615,10 +1723,12 @@ class SecureLLMApp(MDApp):
     def on_start(self):
         _cleanup_tmp_dir()
         logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR))
+
         try:
             self.root.ids.screen_manager.current = "road"
         except Exception:
             pass
+
         Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
         Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
         Clock.schedule_interval(lambda dt: self._debug_auto_refresh(), 0.35)
@@ -1666,7 +1776,7 @@ class SecureLLMApp(MDApp):
         }
         scan_id = uuid.uuid4().hex[:10]
         self.set_status("Scanning road risk...")
-        logger.info("road scan req id=%s fields=%s", scan_id, ",".join(sorted([k for k in data.keys()])))
+        logger.info("road scan req id=%s fields=%s", scan_id, ",".join(sorted(data.keys())))
         threading.Thread(target=self._scan_worker, args=(data, scan_id), daemon=True).start()
 
     def _scan_worker(self, data: dict, scan_id: str):
@@ -1689,14 +1799,16 @@ class SecureLLMApp(MDApp):
         logger.info("road scan done id=%s label=%s raw_len=%d", scan_id, label, len(raw or ""))
 
     def gui_model_refresh(self):
-        s = []
-        s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
-        s.append(f"Plain: {'YES' if MODEL_PATH.exists() else 'no'}")
-        s.append(f"Key: {'YES' if KEY_PATH.exists() else 'no'}")
+        s = [
+            f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}",
+            f"Plain: {'YES' if MODEL_PATH.exists() else 'no'}",
+            f"Key: {'YES' if KEY_PATH.exists() else 'no'}",
+        ]
         if MODEL_PATH.exists():
             s.append(f"PlainMB: {MODEL_PATH.stat().st_size/1024/1024:.1f}")
         if ENCRYPTED_MODEL.exists():
             s.append(f"EncMB: {ENCRYPTED_MODEL.stat().st_size/1024/1024:.1f}")
+
         self.root.ids.model_status.text = " | ".join(s)
         self.root.ids.model_progress.value = 0
         logger.info("model refresh %s", " | ".join(s))
@@ -1823,6 +1935,7 @@ class SecureLLMApp(MDApp):
     def gui_history_refresh(self):
         self.set_status("Loading history...")
         self.root.ids.history_list.clear_widgets()
+
         page = self._hist_page
         per_page = self._hist_per_page
         search = self._hist_search
@@ -1839,6 +1952,7 @@ class SecureLLMApp(MDApp):
             if not rows:
                 self.root.ids.history_list.add_widget(TwoLineListItem(text="No results", secondary_text="—"))
                 return
+
             for (rid, ts, prompt, resp) in rows:
                 self.root.ids.history_list.add_widget(
                     TwoLineListItem(
@@ -1857,7 +1971,11 @@ class SecureLLMApp(MDApp):
 
     def _history_show_dialog(self, rid, ts, prompt, resp):
         body = f"[{rid}] {ts}\n\nQ:\n{prompt}\n\nA:\n{resp}"
-        dlg = MDDialog(title="History Entry", text=body, buttons=[MDFlatButton(text="Close", on_release=lambda x: dlg.dismiss())])
+        dlg = MDDialog(
+            title="History Entry",
+            text=body,
+            buttons=[MDFlatButton(text="Close", on_release=lambda x: dlg.dismiss())],
+        )
         dlg.open()
 
     def gui_history_next(self):
@@ -1969,7 +2087,6 @@ class SecureLLMApp(MDApp):
     def gui_rekey_random(self):
         def make_new_master():
             return AESGCM.generate_key(256)
-
         self._gui_rekey_common(make_new_master)
 
     def gui_rekey_passphrase_dialog(self):

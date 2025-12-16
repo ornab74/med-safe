@@ -1,3 +1,4 @@
+
 name: Build Android (Debug / Release)
 
 on:
@@ -15,12 +16,12 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROIDSDK: /usr/local/lib/android/sdk
 
-      # ===== Model (build-time only) =====
       MODEL_URL: https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
       MODEL_FILENAME: llama3-small-Q3_K_M.gguf
-
-      # ✅ Hardcoded expected SHA256 of the plaintext GGUF you download
       MODEL_SHA256_EXPECTED: 8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
+
+      GRADLE_OPTS: -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+      JAVA_TOOL_OPTIONS: -Xmx4096m
 
     steps:
       - uses: actions/checkout@v4
@@ -52,12 +53,8 @@ jobs:
           unzip -q tools.zip
           rm tools.zip
           mv cmdline-tools latest
-
-          # ✅ Create legacy tools/bin path expected by older p4a/buildozer checks
           mkdir -p "$ANDROID_SDK_ROOT/tools/bin"
           ln -sf "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$ANDROID_SDK_ROOT/tools/bin/sdkmanager"
-
-          # Put both on PATH
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
 
@@ -75,29 +72,21 @@ jobs:
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
-          # used for build-time encryption step
           pip install cryptography
 
-      # ---------------------------
-      # Build-time OFFLINE MODEL PACKAGING (download + hash check + encrypt)
-      # ---------------------------
       - name: Download GGUF model (build-time)
         run: |
           mkdir -p models
-          echo "Downloading model from: $MODEL_URL"
           curl -L --fail --retry 3 --retry-delay 2 -o "models/$MODEL_FILENAME" "$MODEL_URL"
           ls -lah models
 
       - name: Verify GGUF SHA256 (build-time)
         run: |
-          echo "Expected SHA256: $MODEL_SHA256_EXPECTED"
           ACTUAL="$(sha256sum "models/$MODEL_FILENAME" | awk '{print $1}')"
-          echo "Actual SHA256:   $ACTUAL"
           if [ "$ACTUAL" != "$MODEL_SHA256_EXPECTED" ]; then
             echo "ERROR: Model SHA256 mismatch"
             exit 1
           fi
-          echo "SHA256 OK"
 
       - name: Encrypt model + create wrapped MDK (no runtime internet needed)
         env:
@@ -107,7 +96,6 @@ jobs:
             echo "ERROR: Missing secrets.BOOTSTRAP_SECRET"
             exit 1
           fi
-
           mkdir -p tools
           cat > tools/prepare_model.py <<'PY'
           import os, sys, hashlib
@@ -115,19 +103,15 @@ jobs:
           from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
           from cryptography.hazmat.primitives.kdf.hkdf import HKDF
           from cryptography.hazmat.primitives import hashes
-
           CHUNK = 1024 * 1024
-
           def sha256_file(p: Path) -> str:
               h = hashlib.sha256()
               with p.open("rb") as f:
                   for chunk in iter(lambda: f.read(CHUNK), b""):
                       h.update(chunk)
               return h.hexdigest()
-
           def hkdf32(secret: bytes, info: bytes) -> bytes:
               return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
-
           def encrypt_file_gcm(src: Path, dst: Path, key32: bytes):
               nonce = os.urandom(12)
               enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
@@ -142,61 +126,36 @@ jobs:
                   enc.finalize()
                   fout.write(enc.tag)
               tmp.replace(dst)
-
           def encrypt_bytes_gcm(pt: bytes, key32: bytes) -> bytes:
               nonce = os.urandom(12)
               enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
               ct = enc.update(pt) + enc.finalize()
               return nonce + ct + enc.tag
-
           def main():
               secret = os.environ.get("BOOTSTRAP_SECRET", "").encode("utf-8")
               if not secret:
-                  print("Missing BOOTSTRAP_SECRET", file=sys.stderr)
                   sys.exit(2)
-
               if len(sys.argv) != 3:
-                  print("Usage: prepare_model.py <model.gguf> <out_models_dir>", file=sys.stderr)
                   sys.exit(2)
-
               src = Path(sys.argv[1]).resolve()
               out_dir = Path(sys.argv[2]).resolve()
               out_dir.mkdir(parents=True, exist_ok=True)
-
               model_name = src.name
               out_enc = out_dir / (model_name + ".aes")
               out_wrap = out_dir / (model_name + ".mdk.wrap")
               out_sha  = out_dir / (model_name + ".sha256")
-
-              # Model Data Key (MDK) encrypts GGUF
               mdk = os.urandom(32)
-
-              # Bootstrap key wraps MDK
               bootstrap_key = hkdf32(secret, b"qroadscan/bootstrap/v1")
-
               encrypt_file_gcm(src, out_enc, mdk)
               out_wrap.write_bytes(encrypt_bytes_gcm(mdk, bootstrap_key))
               out_sha.write_text(sha256_file(src), encoding="utf-8")
-
-              print("OK:", out_enc)
-              print("OK:", out_wrap)
-              print("OK:", out_sha)
-
           if __name__ == "__main__":
               main()
           PY
-
           python tools/prepare_model.py "models/$MODEL_FILENAME" models
-
-          # ✅ Remove plaintext model so it never ships
           rm -f "models/$MODEL_FILENAME"
-
-          echo "Models directory after encryption:"
           ls -lah models
 
-      # ---------------------------
-      # Build artifacts (Release vs Debug)
-      # ---------------------------
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
         run: |
@@ -216,7 +175,6 @@ jobs:
           ls -lah bin
 
       - name: Build debug APK
-        if: github.event_name == 'pull_request'
         run: |
           buildozer -v android debug
           ls -lah bin
@@ -230,9 +188,144 @@ jobs:
           if-no-files-found: error
 
       - name: Upload DEBUG APK
-        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: QRS-Android-APK
           path: bin/*.apk
           if-no-files-found: error
+
+  ui_smoke:
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools (for aapt)
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "build-tools;35.0.0"
+
+      - name: Download DEBUG APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: QRS-Android-APK
+          path: artifacts
+
+      - name: Resolve APK + package + launch activity
+        id: apkmeta
+        run: |
+          APK="$(ls -1 artifacts/*.apk | head -n 1)"
+          echo "apk=$APK" >> $GITHUB_OUTPUT
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          PKG="$("$AAPT" dump badging "$APK" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          ACT="$("$AAPT" dump badging "$APK" | sed -n "s/^launchable-activity: name='\([^']*\)'.*/\1/p" | head -n 1)"
+          if [ -z "$PKG" ] || [ -z "$ACT" ]; then
+            echo "Failed to parse package/activity"
+            "$AAPT" dump badging "$APK" | head -n 80
+            exit 1
+          fi
+          echo "pkg=$PKG" >> $GITHUB_OUTPUT
+          echo "act=$ACT" >> $GITHUB_OUTPUT
+          echo "PKG=$PKG"
+          echo "ACT=$ACT"
+
+      - name: Emulator GUI smoke test (type location + press Scan)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          profile: pixel_5
+          disable-animations: true
+          ram-size: 4096M
+          heap-size: 1024M
+          emulator-options: -no-snapshot-save -noaudio -no-boot-anim -gpu swiftshader_indirect
+          script: |
+            set -e
+            APK="${{ steps.apkmeta.outputs.apk }}"
+            PKG="${{ steps.apkmeta.outputs.pkg }}"
+            ACT="${{ steps.apkmeta.outputs.act }}"
+
+            adb wait-for-device
+            adb shell settings put global window_animation_scale 0 || true
+            adb shell settings put global transition_animation_scale 0 || true
+            adb shell settings put global animator_duration_scale 0 || true
+
+            adb install -r "$APK"
+
+            adb shell am start -n "$PKG/$ACT" || adb shell monkey -p "$PKG" 1
+            sleep 8
+
+            SIZE="$(adb shell wm size | tr -d '\r' | tail -n 1 | sed -n 's/.* \([0-9]\+\)x\([0-9]\+\).*/\1 \2/p')"
+            W="$(echo "$SIZE" | awk '{print $1}')"
+            H="$(echo "$SIZE" | awk '{print $2}')"
+            if [ -z "$W" ] || [ -z "$H" ]; then
+              W=1080
+              H=1920
+            fi
+
+            cx() { python - <<PY; w=$W; print(int(w*float("$1"))); PY; }
+            cy() { python - <<PY; h=$H; print(int(h*float("$1"))); PY; }
+
+            TAPC_X="$(cx 0.50)"
+
+            CONT_Y="$(cy 0.82)"
+            adb shell input tap "$TAPC_X" "$CONT_Y" || true
+            sleep 1
+            adb shell input tap "$TAPC_X" "$CONT_Y" || true
+            sleep 2
+
+            adb shell input swipe "$TAPC_X" "$(cy 0.78)" "$TAPC_X" "$(cy 0.48)" 260 || true
+            sleep 1
+
+            LOC_Y="$(cy 0.72)"
+            adb shell input tap "$TAPC_X" "$LOC_Y"
+            sleep 1
+            adb shell input text ",JFK%20airpor"
+            sleep 1
+            adb shell input keyevent 111 || true
+            sleep 1
+
+            SCAN_Y="$(cy 0.84)"
+            adb shell input tap "$TAPC_X" "$SCAN_Y"
+            sleep 2
+
+            adb exec-out screencap -p > screen_after_tap.png || true
+
+            sleep 25
+
+            adb exec-out screencap -p > screen_after_scan.png || true
+
+            adb shell run-as "$PKG" ls files >/dev/null 2>&1 || (echo "run-as failed (ensure debug build is debuggable)" && exit 1)
+            adb shell run-as "$PKG" ls files/qroadscan_data >/dev/null 2>&1 || true
+
+            adb shell run-as "$PKG" cat files/qroadscan_data/debug.log > debug.log || true
+
+            if [ ! -s debug.log ]; then
+              echo "debug.log missing/empty"
+              exit 1
+            fi
+
+            grep -E "SCAN_UI: clicked|SCAN: start|SCAN: done|SCAN_UI: done" debug.log >/dev/null || (echo "No scan markers found in debug.log" && tail -n 200 debug.log && exit 1)
+
+            echo "PASS"
+
+      - name: Upload UI test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: UI-Test-Artifacts
+          path: |
+            debug.log
+            screen_after_tap.png
+            screen_after_scan.png
+          if-no-files-found: warn

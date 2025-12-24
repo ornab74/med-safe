@@ -24,17 +24,10 @@ android.version_code = 203746222
 # - p4a typically expects pip name "llama-cpp-python" (not llama_cpp_python).
 # - If you use a custom recipe for llama, keep p4a.local_recipes and still list the pip name.
 # - httpx is optional if you're using urllib for download; keep if you prefer httpx.
-requirements =
-    python3,
-    kivy==2.2.1,
-    kivymd,
-    cryptography,
-    aiosqlite,
-    psutil,
-    llama-cpp-python,
-    httpx
 
-# Local recipes (optional; use if you have custom recipes for llama / deps)
+
+requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
+
 p4a.local_recipes = ./p4a_recipes
 
 # ----------------------------
@@ -107,4 +100,6 @@ log_level = 2
 warn_on_root = 1
 build_dir = .buildozer
 android.accept_sdk_license = True
-```0
+
+
+

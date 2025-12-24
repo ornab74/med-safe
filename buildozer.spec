@@ -14,8 +14,8 @@ source.dir = .
 source.main = main.py
 
 # Human version + monotonically increasing version_code
-version = 0.1.20
-android.version_code = 203746222
+version = 0.1.21
+android.version_code = 203746223
 
 # ----------------------------
 # Python / deps

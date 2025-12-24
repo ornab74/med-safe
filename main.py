@@ -1,16 +1,32 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MedSafe — Multi-med reminder + dosage check (Low/Medium/High) + llama.cpp offline classifier
++ Android foreground sticky service controls (for background reminders)
+
+Project layout (recommended):
+  main.py
+  service/med_service.py     # background reminder service (separate process)
+  buildozer.spec
+
+IMPORTANT:
+- Set MODEL_URL + MODEL_SHA256 to your GGUF location + hash.
+- This file keeps working even if the model isn't ready: it falls back to heuristic checks.
+"""
+
 import os
 import re
+import json
+import time
 import uuid
 import math
-import time
 import hashlib
 import threading
 import logging
-import gc
-import random
+import urllib.request
 
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List, Callable
+from typing import Optional, Dict, Any, List, Tuple, Callable
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,10 +48,11 @@ from kivy.animation import Animation
 from kivymd.app import MDApp
 from kivymd.uix.label import MDLabel
 from kivymd.uix.button import MDRaisedButton, MDFlatButton, MDIconButton
-from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
 from kivymd.uix.screen import MDScreen
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.list import MDList, OneLineListItem
+from kivymd.uix.bottomnavigation import MDBottomNavigation, MDBottomNavigationItem
 
 try:
     from kivymd.uix.toolbar import MDTopAppBar as _MDAppBar
@@ -49,109 +66,53 @@ try:
 except Exception:
     autoclass = None
 
+# Optional: runtime notification permission helper (Android 13+)
 try:
-    import psutil
+    from android.permissions import request_permissions, Permission  # type: ignore
 except Exception:
-    psutil = None
+    request_permissions = None
+    Permission = None
 
-try:
-    import pennylane as qml
-    import pennylane.numpy as pnp
-except Exception:
-    qml = None
-    pnp = None
 
-if _kivy_platform != "android" and hasattr(Window, "size"):
-    Window.size = (420, 800)
+# ---------------------------
+# YOU MUST SET THESE
+# ---------------------------
+MODEL_URL = "https://YOUR_HOST/YOUR_MODEL.gguf"  # <- set me
+MODEL_SHA256 = "YOUR_64_HEX_SHA256"              # <- set me
+MODEL_FILENAME = "medsafe_model.gguf"
+CHUNK = 1024 * 1024
 
+# Thread caps (avoid BLAS thread storms)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-CHUNK = 1024 * 1024
+if _kivy_platform != "android" and hasattr(Window, "size"):
+    Window.size = (420, 900)
 
-PKG_DIR = Path(__file__).resolve().parent
-MODELS_SHIPPED = PKG_DIR / "models"
 
-BASE_DIR: Optional[Path] = None
-TMP_DIR: Optional[Path] = None
-INSTALL_MASTER_PATH: Optional[Path] = None
-INSTALL_MDK_WRAP_PATH: Optional[Path] = None
-FIRST_BOOT_FLAG_PATH: Optional[Path] = None
-LOG_PATH: Optional[Path] = None
-
-logger = logging.getLogger("qroadscan")
+# ---------------------------
+# Logging
+# ---------------------------
+logger = logging.getLogger("medsafe")
 logger.setLevel(logging.INFO)
 
-class _FileHandler(logging.Handler):
-    def __init__(self, get_log_path: Callable[[], Optional[Path]]):
-        super().__init__()
-        self._fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        self._get_log_path = get_log_path
 
-    def emit(self, record):
-        try:
-            msg = self._fmt.format(record)
-        except Exception:
-            msg = str(record.getMessage())
-        try:
-            lp = self._get_log_path()
-            if lp is not None:
-                lp.parent.mkdir(parents=True, exist_ok=True)
-                with lp.open("a", encoding="utf-8") as f:
-                    f.write(msg + "\n")
-        except Exception:
-            pass
-        try:
-            app = MDApp.get_running_app()
-            if app:
-                app._debug_dirty = True
-        except Exception:
-            pass
-
-def _get_log_path() -> Optional[Path]:
-    return LOG_PATH
-
-if not any(isinstance(h, _FileHandler) for h in logger.handlers):
-    logger.addHandler(_FileHandler(_get_log_path))
-
-def _read_log_tail(max_chars: int = 140_000) -> str:
-    try:
-        if LOG_PATH is None or not LOG_PATH.exists():
-            return "—"
-        t = LOG_PATH.read_text(encoding="utf-8", errors="ignore")
-        return t[-max_chars:] if len(t) > max_chars else t
-    except Exception:
-        return "—"
-
-def _pick_model_files():
-    if not MODELS_SHIPPED.exists():
-        return None, None, None
-    aes_candidates = sorted(MODELS_SHIPPED.glob("*.gguf.aes")) + sorted(MODELS_SHIPPED.glob("*.aes"))
-    for enc_path in aes_candidates:
-        base_name = enc_path.name[:-4]
-        wrap_path = MODELS_SHIPPED / (base_name + ".mdk.wrap")
-        sha_path = MODELS_SHIPPED / (base_name + ".sha256")
-        if wrap_path.exists():
-            return enc_path, wrap_path, sha_path
-    return (aes_candidates[0], None, None) if aes_candidates else (None, None, None)
-
-MODEL_ENC_PATH, MODEL_BOOT_WRAP_PATH, MODEL_SHA_PATH = _pick_model_files()
-
-def _require_paths():
-    if BASE_DIR is None or TMP_DIR is None or INSTALL_MASTER_PATH is None or INSTALL_MDK_WRAP_PATH is None or FIRST_BOOT_FLAG_PATH is None or LOG_PATH is None:
-        raise RuntimeError("paths not initialized")
-
+# ---------------------------
+# Crypto utils (AES-GCM)
+# ---------------------------
 def hkdf32(secret: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
+
 
 def encrypt_bytes_gcm(pt: bytes, key32: bytes) -> bytes:
     nonce = os.urandom(12)
     enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
     ct = enc.update(pt) + enc.finalize()
     return nonce + ct + enc.tag
+
 
 def decrypt_bytes_gcm(blob: bytes, key32: bytes) -> bytes:
     if len(blob) < 12 + 16:
@@ -162,7 +123,30 @@ def decrypt_bytes_gcm(blob: bytes, key32: bytes) -> bytes:
     dec = Cipher(algorithms.AES(key32), modes.GCM(nonce, tag)).decryptor()
     return dec.update(ct) + dec.finalize()
 
+
+def encrypt_file_gcm(src: Path, dst: Path, key32: bytes):
+    """
+    Stream encrypt: dst format = nonce(12) + ciphertext + tag(16)
+    """
+    nonce = os.urandom(12)
+    enc = Cipher(algorithms.AES(key32), modes.GCM(nonce)).encryptor()
+    tmp = dst.with_suffix(dst.suffix + f".tmp.{uuid.uuid4().hex}")
+    with src.open("rb") as fin, tmp.open("wb") as fout:
+        fout.write(nonce)
+        while True:
+            buf = fin.read(CHUNK)
+            if not buf:
+                break
+            fout.write(enc.update(buf))
+        enc.finalize()
+        fout.write(enc.tag)
+    tmp.replace(dst)
+
+
 def decrypt_file_gcm(src: Path, dst: Path, key32: bytes):
+    """
+    Stream decrypt for files written by encrypt_file_gcm.
+    """
     with src.open("rb") as fin:
         nonce = fin.read(12)
         fin.seek(0, os.SEEK_END)
@@ -187,10 +171,12 @@ def decrypt_file_gcm(src: Path, dst: Path, key32: bytes):
             dec.finalize()
         tmp.replace(dst)
 
+
 def _atomic_write(path: Path, data: bytes):
     tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
     tmp.write_bytes(data)
     tmp.replace(path)
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -199,352 +185,400 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def _get_bootstrap_secret() -> bytes:
-    try:
-        import bootstrap_secret  # type: ignore
-        b64 = getattr(bootstrap_secret, "BOOTSTRAP_SECRET_B64", "")
-        if isinstance(b64, str) and b64.strip():
-            import base64
-            return base64.urlsafe_b64decode(b64 + "==")
-    except Exception:
-        pass
-    s = os.environ.get("ANDROID_BOOTSTRAP_SECRET", "")
-    if s:
-        return s.encode("utf-8")
-    return b"CHANGE_ME_USE_BUILD_TIME_INJECTION"
 
-def bootstrap_key() -> bytes:
-    return hkdf32(_get_bootstrap_secret(), b"qroadscan/bootstrap/v1")
-
-def _load_install_master() -> Optional[bytes]:
-    _require_paths()
+# ---------------------------
+# Android files dir
+# ---------------------------
+def _android_files_dir() -> Optional[Path]:
+    """
+    Stable directory shared between UI app and service: Context.getFilesDir().
+    """
+    if _kivy_platform != "android" or autoclass is None:
+        return None
     try:
-        if not INSTALL_MASTER_PATH.exists():
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        act = PythonActivity.mActivity
+        if act is None:
             return None
-        b = INSTALL_MASTER_PATH.read_bytes()
-        return b[:32] if len(b) >= 32 else None
+        d = act.getFilesDir().getAbsolutePath()
+        return Path(str(d))
     except Exception:
         return None
 
-def _save_install_master(k: bytes):
-    _require_paths()
-    _atomic_write(INSTALL_MASTER_PATH, k)
 
-def _unwrap_mdk() -> bytes:
-    _require_paths()
-    master = _load_install_master()
-    if master and INSTALL_MDK_WRAP_PATH.exists():
+# ---------------------------
+# Vault (med schedules + history)
+# ---------------------------
+class Vault:
+    """
+    Shared encrypted vault (UI + service read/write in files_dir/medsafe_data).
+    File: meds.json.aes
+    """
+    def __init__(self, files_dir: Path):
+        self.base = files_dir / "medsafe_data"
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.install_master_path = self.base / ".install_master_key"
+        self.vault_wrap_path = self.base / ".vault_mdk.wrap"
+        self.meds_path = self.base / "meds.json.aes"
+        self.lock = threading.Lock()
+
+    def _load_install_master(self) -> Optional[bytes]:
         try:
-            blob = INSTALL_MDK_WRAP_PATH.read_bytes()
-            mdk = decrypt_bytes_gcm(blob, master)
-            if len(mdk) != 32:
-                raise RuntimeError("bad mdk length")
+            if not self.install_master_path.exists():
+                return None
+            b = self.install_master_path.read_bytes()
+            return b[:32] if len(b) >= 32 else None
+        except Exception:
+            return None
+
+    def _save_install_master(self, k: bytes):
+        _atomic_write(self.install_master_path, k)
+
+    def _unwrap_mdk(self) -> bytes:
+        master = self._load_install_master()
+        if master is None:
+            master = os.urandom(32)
+            self._save_install_master(master)
+            mdk = os.urandom(32)
+            _atomic_write(self.vault_wrap_path, encrypt_bytes_gcm(mdk, master))
             return mdk
-        except Exception:
+
+        if not self.vault_wrap_path.exists():
+            mdk = os.urandom(32)
+            _atomic_write(self.vault_wrap_path, encrypt_bytes_gcm(mdk, master))
+            return mdk
+
+        blob = self.vault_wrap_path.read_bytes()
+        try:
+            mdk = decrypt_bytes_gcm(blob, master)
+        except InvalidTag:
+            # corrupted -> reset
+            mdk = os.urandom(32)
+            _atomic_write(self.vault_wrap_path, encrypt_bytes_gcm(mdk, master))
+            return mdk
+
+        if len(mdk) != 32:
+            mdk = os.urandom(32)
+            _atomic_write(self.vault_wrap_path, encrypt_bytes_gcm(mdk, master))
+        return mdk
+
+    def load(self) -> Dict[str, Any]:
+        with self.lock:
+            mdk = self._unwrap_mdk()
+            if not self.meds_path.exists():
+                return {"version": 1, "meds": []}
             try:
-                INSTALL_MDK_WRAP_PATH.unlink(missing_ok=True)
+                blob = self.meds_path.read_bytes()
+                pt = decrypt_bytes_gcm(blob, mdk)
+                obj = json.loads(pt.decode("utf-8", errors="ignore") or "{}")
+                if not isinstance(obj, dict):
+                    return {"version": 1, "meds": []}
+                obj.setdefault("version", 1)
+                obj.setdefault("meds", [])
+                return obj
             except Exception:
-                pass
+                return {"version": 1, "meds": []}
+
+    def save(self, obj: Dict[str, Any]):
+        with self.lock:
+            mdk = self._unwrap_mdk()
+            raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            blob = encrypt_bytes_gcm(raw, mdk)
+            _atomic_write(self.meds_path, blob)
+
+
+# ---------------------------
+# ModelManager (auto-download + verify + encrypt)
+# ---------------------------
+class ModelManager:
+    """
+    First run:
+      - downloads plaintext .gguf to models/
+      - verifies sha256
+      - encrypts to models/<MODEL>.aes with per-install key wrap
+      - deletes plaintext
+
+    Runtime:
+      - decrypts to tmp plaintext while llama_cpp is loading
+      - deletes plaintext after
+    """
+    def __init__(self, files_dir: Path):
+        self.base = files_dir / "medsafe_data"
+        self.base.mkdir(parents=True, exist_ok=True)
+
+        self.models_dir = self.base / "models"
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        self.tmp_dir = self.base / "tmp"
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        self.install_master_path = self.base / ".install_master_key"
+        self.install_mdk_wrap_path = self.base / ".mdk.wrap.install"
+
+        self.model_enc_path = self.models_dir / (MODEL_FILENAME + ".aes")
+        self.model_sha_path = self.models_dir / (MODEL_FILENAME + ".sha256")
+
+        self._lock = threading.Lock()
+
+    def _load_install_master(self) -> Optional[bytes]:
+        try:
+            if not self.install_master_path.exists():
+                return None
+            b = self.install_master_path.read_bytes()
+            return b[:32] if len(b) >= 32 else None
+        except Exception:
+            return None
+
+    def _save_install_master(self, k: bytes):
+        _atomic_write(self.install_master_path, k)
+
+    def _unwrap_mdk(self) -> bytes:
+        master = self._load_install_master()
+        if master and self.install_mdk_wrap_path.exists():
             try:
-                INSTALL_MASTER_PATH.unlink(missing_ok=True)
+                blob = self.install_mdk_wrap_path.read_bytes()
+                mdk = decrypt_bytes_gcm(blob, master)
+                if len(mdk) != 32:
+                    raise RuntimeError("bad mdk length")
+                return mdk
             except Exception:
-                pass
-    if MODEL_BOOT_WRAP_PATH is None or not MODEL_BOOT_WRAP_PATH.exists():
-        raise RuntimeError("Missing shipped .mdk.wrap (bootstrap)")
-    blob = MODEL_BOOT_WRAP_PATH.read_bytes()
-    try:
-        mdk = decrypt_bytes_gcm(blob, bootstrap_key())
-    except InvalidTag as e:
-        raise RuntimeError("bootstrap unwrap failed (wrong bootstrap secret)") from e
-    if len(mdk) != 32:
-        raise RuntimeError("bad mdk length")
-    new_master = os.urandom(32)
-    _save_install_master(new_master)
-    install_wrap = encrypt_bytes_gcm(mdk, new_master)
-    _atomic_write(INSTALL_MDK_WRAP_PATH, install_wrap)
-    logger.info("first-boot key rotation complete (install wrap created)")
-    return mdk
-
-def _tmp_plain_model_path() -> Path:
-    _require_paths()
-    return TMP_DIR / f"model_plain.{uuid.uuid4().hex}.gguf"
-
-@contextmanager
-def acquire_plain_model() -> Path:
-    _require_paths()
-    if MODEL_ENC_PATH is None or not MODEL_ENC_PATH.exists():
-        raise FileNotFoundError("Missing shipped encrypted model (.aes) in ./models")
-    mdk = _unwrap_mdk()
-    plain = _tmp_plain_model_path()
-    decrypt_file_gcm(MODEL_ENC_PATH, plain, mdk)
-    try:
-        if MODEL_SHA_PATH is not None and MODEL_SHA_PATH.exists():
-            expected = (MODEL_SHA_PATH.read_text(encoding="utf-8", errors="ignore") or "").strip().split()[0]
-            if expected and re.fullmatch(r"[0-9a-fA-F]{64}", expected):
-                actual = sha256_file(plain)
-                if actual.lower() != expected.lower():
-                    raise RuntimeError(f"model sha mismatch: {actual} != {expected}")
-    except Exception:
-        try:
-            plain.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
-    try:
-        yield plain
-    finally:
-        try:
-            plain.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-def load_llama(model_path: Path):
-    from llama_cpp import Llama
-    try:
-        c = os.cpu_count() or 1
-    except Exception:
-        c = 1
-    threads = 2 if c >= 2 else 1
-    return Llama(
-        model_path=str(model_path),
-        n_ctx=512,
-        n_threads=threads,
-        n_batch=64,
-        use_mmap=False,
-        use_mlock=False,
-        n_gpu_layers=0,
-        verbose=False,
-    )
-
-def _read_proc_stat():
-    try:
-        with open("/proc/stat", "r") as f:
-            line = f.readline()
-        if not line.startswith("cpu "):
-            return None
-        parts = line.split()
-        vals = [int(x) for x in parts[1:]]
-        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
-        total = sum(vals)
-        return total, idle
-    except Exception:
-        return None
-
-def _cpu_percent_from_proc(sample_interval=0.12):
-    t1 = _read_proc_stat()
-    if not t1:
-        return None
-    time.sleep(sample_interval)
-    t2 = _read_proc_stat()
-    if not t2:
-        return None
-    total1, idle1 = t1
-    total2, idle2 = t2
-    total_delta = total2 - total1
-    idle_delta = idle2 - idle1
-    if total_delta <= 0:
-        return None
-    usage = (total_delta - idle_delta) / float(total_delta)
-    return max(0.0, min(1.0, usage))
-
-def _mem_from_proc():
-    try:
-        info = {}
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                parts = line.split(":")
-                if len(parts) < 2:
-                    continue
-                k = parts[0].strip()
-                v = parts[1].strip().split()[0]
-                info[k] = int(v)
-        total = info.get("MemTotal")
-        available = info.get("MemAvailable", None)
-        if total is None:
-            return None
-        if available is None:
-            available = info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0)
-        used_fraction = max(0.0, min(1.0, (total - available) / float(total)))
-        return used_fraction
-    except Exception:
-        return None
-
-def _load1_from_proc(cpu_count_fallback=1):
-    try:
-        with open("/proc/loadavg", "r") as f:
-            first = f.readline().split()[0]
-        load1 = float(first)
-        try:
-            cpu_cnt = os.cpu_count() or cpu_count_fallback
-        except Exception:
-            cpu_cnt = cpu_count_fallback
-        val = load1 / max(1.0, float(cpu_cnt))
-        return max(0.0, min(1.0, val))
-    except Exception:
-        return None
-
-def _proc_count_from_proc():
-    try:
-        pids = [name for name in os.listdir("/proc") if name.isdigit()]
-        return max(0.0, min(1.0, len(pids) / 1000.0))
-    except Exception:
-        return None
-
-def _read_temperature():
-    temps = []
-    try:
-        base = "/sys/class/thermal"
-        if os.path.isdir(base):
-            for entry in os.listdir(base):
-                if not entry.startswith("thermal_zone"):
-                    continue
-                path = os.path.join(base, entry, "temp")
                 try:
-                    with open(path, "r") as f:
-                        raw = f.read().strip()
-                    if not raw:
-                        continue
-                    val = int(raw)
-                    c = val / 1000.0 if val > 1000 else float(val)
-                    temps.append(c)
+                    self.install_mdk_wrap_path.unlink(missing_ok=True)
                 except Exception:
-                    continue
-        if not temps:
-            return None
-        avg_c = sum(temps) / len(temps)
-        norm = (avg_c - 20.0) / (90.0 - 20.0)
-        return max(0.0, min(1.0, norm))
-    except Exception:
-        return None
+                    pass
+                try:
+                    self.install_master_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-def collect_system_metrics() -> Dict[str, float]:
-    cpu = mem = load1 = temp = proc = None
-    if psutil is not None:
+        mdk = os.urandom(32)
+        new_master = os.urandom(32)
+        self._save_install_master(new_master)
+        wrap = encrypt_bytes_gcm(mdk, new_master)
+        _atomic_write(self.install_mdk_wrap_path, wrap)
+        logger.info("MODEL: first-run key material created")
+        return mdk
+
+    def is_ready(self) -> bool:
+        return self.model_enc_path.exists() and self.model_sha_path.exists()
+
+    def _download_to(self, dst: Path, progress_cb: Optional[Callable[[int, int], None]] = None):
+        tmp = dst.with_suffix(dst.suffix + f".tmp.{uuid.uuid4().hex}")
+        req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "MedSafe/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            got = 0
+            with tmp.open("wb") as out:
+                while True:
+                    buf = resp.read(CHUNK)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    got += len(buf)
+                    if progress_cb:
+                        progress_cb(got, total)
+        tmp.replace(dst)
+
+    def ensure_ready(self, progress_cb: Optional[Callable[[int, int], None]] = None):
+        """
+        Call off-thread. Safe to call multiple times.
+        """
+        with self._lock:
+            if self.is_ready():
+                return
+
+            expected = (MODEL_SHA256 or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise RuntimeError("MODEL_SHA256 not set / invalid")
+
+            if not (MODEL_URL or "").startswith("http"):
+                raise RuntimeError("MODEL_URL not set / invalid")
+
+            plain_path = self.models_dir / (MODEL_FILENAME + f".plain.{uuid.uuid4().hex}.gguf")
+            try:
+                logger.info("MODEL: downloading %s", MODEL_URL)
+                self._download_to(plain_path, progress_cb=progress_cb)
+
+                actual = sha256_file(plain_path).lower()
+                if actual != expected:
+                    raise RuntimeError(f"model sha mismatch: {actual} != {expected}")
+
+                mdk = self._unwrap_mdk()
+                logger.info("MODEL: encrypting")
+                encrypt_file_gcm(plain_path, self.model_enc_path, mdk)
+                _atomic_write(self.model_sha_path, (expected + "\n").encode("utf-8"))
+                logger.info("MODEL: ready (encrypted)")
+            finally:
+                try:
+                    plain_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def cleanup_tmp(self):
         try:
-            cpu = psutil.cpu_percent(interval=0.1) / 100.0
-            mem = psutil.virtual_memory().percent / 100.0
-            try:
-                load_raw = os.getloadavg()[0]
-                cpu_cnt = psutil.cpu_count(logical=True) or 1
-                load1 = max(0.0, min(1.0, load_raw / max(1.0, float(cpu_cnt))))
-            except Exception:
-                load1 = None
-            try:
-                temps_map = psutil.sensors_temperatures()
-                if temps_map:
-                    first = next(iter(temps_map.values()))[0].current
-                    temp = max(0.0, min(1.0, (first - 20.0) / 70.0))
-                else:
-                    temp = None
-            except Exception:
-                temp = None
-            try:
-                proc = min(len(psutil.pids()) / 1000.0, 1.0)
-            except Exception:
-                proc = None
+            for p in self.tmp_dir.glob("model_plain.*.gguf"):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
         except Exception:
-            cpu = mem = load1 = temp = proc = None
-    if cpu is None:
-        cpu = _cpu_percent_from_proc()
-    if mem is None:
-        mem = _mem_from_proc()
-    if load1 is None:
-        load1 = _load1_from_proc()
-    if proc is None:
-        proc = _proc_count_from_proc()
-    if temp is None:
-        temp = _read_temperature()
-    cpu = float(max(0.0, min(1.0, float(cpu or 0.0))))
-    mem = float(max(0.0, min(1.0, float(mem or 0.0))))
-    load1 = float(max(0.0, min(1.0, float(load1 or 0.0))))
-    proc = float(max(0.0, min(1.0, float(proc or 0.0))))
-    temp = float(max(0.0, min(1.0, float(temp or 0.0))))
-    return {"cpu": cpu, "mem": mem, "load1": load1, "temp": temp, "proc": proc}
+            pass
 
-def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
-    cpu = metrics.get("cpu", 0.1)
-    mem = metrics.get("mem", 0.1)
-    temp = metrics.get("temp", 0.1)
-    load1 = metrics.get("load1", 0.0)
-    proc = metrics.get("proc", 0.0)
-    r = cpu * (1.0 + load1)
-    g = mem * (1.0 + proc)
-    b = temp * (0.5 + cpu * 0.5)
-    maxi = max(r, g, b, 1.0)
-    r, g, b = r / maxi, g / maxi, b / maxi
-    return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
+    @contextmanager
+    def acquire_plain_model(self) -> Path:
+        """
+        Decrypt encrypted model into tmp plaintext file, yield path, delete after.
+        """
+        with self._lock:
+            if not self.is_ready():
+                raise FileNotFoundError("Model not ready")
+            expected = (self.model_sha_path.read_text(encoding="utf-8", errors="ignore") or "").strip().split()[0].lower()
+            mdk = self._unwrap_mdk()
 
-def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
-    if qml is None or pnp is None:
-        r, g, b = rgb
-        seed = int((int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255))
-        random.seed(seed)
-        base = (0.3 * r + 0.4 * g + 0.3 * b)
-        noise = (random.random() - 0.5) * 0.08
-        return max(0.0, min(1.0, base + noise))
-    dev = qml.device("default.qubit", wires=2, shots=shots)
-    @qml.qnode(dev)
-    def circuit(a, b, c):
-        qml.RX(a * math.pi, wires=0)
-        qml.RY(b * math.pi, wires=1)
-        qml.CNOT(wires=[0, 1])
-        qml.RZ(c * math.pi, wires=1)
-        qml.RX((a + b) * math.pi / 2, wires=0)
-        qml.RY((b + c) * math.pi / 2, wires=1)
-        return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1))
-    a, b, c = float(rgb[0]), float(rgb[1]), float(rgb[2])
+            plain = self.tmp_dir / f"model_plain.{uuid.uuid4().hex}.gguf"
+            decrypt_file_gcm(self.model_enc_path, plain, mdk)
+
+            # verify decrypted sha (guard)
+            actual = sha256_file(plain).lower()
+            if expected and actual != expected:
+                try:
+                    plain.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise RuntimeError("decrypted model sha mismatch")
+
+        try:
+            yield plain
+        finally:
+            try:
+                plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ---------------------------
+# Risk / schedule logic
+# ---------------------------
+def _now() -> float:
+    return time.time()
+
+
+def _safe_float(s: str) -> float:
     try:
-        ev0, ev1 = circuit(a, b, c)
-        combined = ((ev0 + 1.0) / 2.0 * 0.6 + (ev1 + 1.0) / 2.0 * 0.4)
-        score = 1.0 / (1.0 + math.exp(-6.0 * (combined - 0.5)))
-        return float(max(0.0, min(1.0, score)))
+        return float((s or "").strip())
     except Exception:
-        return float(0.5 * (a + b + c) / 3.0)
+        return 0.0
 
-def entropic_summary_text(score: float) -> str:
-    if score >= 0.75:
-        level = "high"
-    elif score >= 0.45:
-        level = "medium"
-    else:
-        level = "low"
-    return f"entropic_score={score:.3f} (level={level})"
 
+def compute_next_due(med: Dict[str, Any], now_ts: float) -> Optional[float]:
+    interval_h = float(med.get("interval_hours") or 0.0)
+    if interval_h <= 0.0:
+        return None
+    last = float(med.get("last_taken_ts") or 0.0)
+    if last <= 0.0:
+        return now_ts
+    return last + interval_h * 3600.0
+
+
+def due_minutes(med: Dict[str, Any], now_ts: float) -> Optional[float]:
+    nd = compute_next_due(med, now_ts)
+    if nd is None:
+        return None
+    return (now_ts - nd) / 60.0  # positive overdue, negative remaining
+
+
+def due_level(minutes_over: float) -> str:
+    if minutes_over < 0:
+        return "Low"
+    if minutes_over >= 240:
+        return "High"
+    if minutes_over >= 60:
+        return "Medium"
+    return "Low"
+
+
+def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tuple[str, str]:
+    """
+    Heuristic Low/Medium/High based on:
+      - too soon since last dose
+      - too much in last 24h relative to max_daily_mg
+    """
+    interval_h = float(med.get("interval_hours") or 0.0)
+    max_daily = float(med.get("max_daily_mg") or 0.0)
+    history = list(med.get("history") or [])
+
+    last_taken = float(med.get("last_taken_ts") or 0.0)
+    mins_since = (now_ts - last_taken) / 60.0 if last_taken > 0 else 1e9
+
+    cutoff = now_ts - 24 * 3600.0
+    total_24h = 0.0
+    for item in history:
+        try:
+            ts = float(item[0])
+            mg = float(item[1])
+            if ts >= cutoff:
+                total_24h += mg
+        except Exception:
+            continue
+    projected = total_24h + max(0.0, float(dose_mg))
+
+    too_soon = (interval_h > 0.0) and (mins_since < interval_h * 60.0 * 0.85)
+    way_too_soon = (interval_h > 0.0) and (mins_since < interval_h * 60.0 * 0.60)
+
+    ratio = (projected / max_daily) if max_daily > 0.0 else 0.0
+
+    if way_too_soon or (max_daily > 0.0 and ratio >= 1.05):
+        return "High", f"Unsafe: timing/daily limit exceeded (24h total ~{projected:g} mg)."
+    if too_soon or (max_daily > 0.0 and ratio >= 0.90):
+        return "Medium", f"Caution: close to limits (24h total ~{projected:g} mg)."
+    return "Low", f"OK: projected 24h total ~{projected:g} mg."
+
+
+# ---------------------------
+# PUNKD / chunked generation (kept from your style)
+# ---------------------------
 def _simple_tokenize(text: str) -> List[str]:
-    return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
+    return [t for t in re.findall(r"[A-Za-z0-9_\-]+", (text or "").lower())]
+
 
 def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
     toks = _simple_tokenize(prompt_text)
     freq: Dict[str, float] = {}
     for t in toks:
         freq[t] = freq.get(t, 0.0) + 1.0
+
     hazard_boost = {
-        "ice": 2.0,
-        "wet": 1.8,
-        "snow": 2.0,
-        "flood": 2.0,
-        "construction": 1.8,
-        "pedestrian": 1.8,
-        "debris": 1.8,
-        "animal": 1.5,
-        "stall": 1.4,
-        "fog": 1.6,
+        # dose/risk keywords
+        "overdose": 2.0,
+        "too": 1.3,
+        "soon": 1.6,
+        "limit": 1.5,
+        "max": 1.4,
+        "daily": 1.4,
+        "unsafe": 1.8,
+        "caution": 1.4,
+        "high": 1.2,
+        "medium": 1.1,
+        "low": 1.1,
     }
+
     scored: Dict[str, float] = {}
     for t, c in freq.items():
         boost = hazard_boost.get(t, 1.0)
         scored[t] = c * boost
+
     items = sorted(scored.items(), key=lambda x: -x[1])[:top_n]
     if not items:
         return {}
     maxv = items[0][1]
     return {k: float(v / maxv) for k, v in items}
 
+
 def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str = "balanced") -> Tuple[str, float]:
     if not token_weights:
         return prompt_text, 1.0
     mean_weight = sum(token_weights.values()) / len(token_weights)
-    profile_map = {"conservative": 0.6, "balanced": 1.0, "aggressive": 1.4}
+    profile_map = {"conservative": 0.7, "balanced": 1.0, "aggressive": 1.3}
     base = profile_map.get(profile, 1.0)
     multiplier = 1.0 + (mean_weight - 0.5) * 0.8 * (base if base > 1.0 else 1.0)
     multiplier = max(0.6, min(1.8, multiplier))
@@ -553,13 +587,14 @@ def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str 
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
     return patched, multiplier
 
+
 def chunked_generate(
     llm,
     prompt: str,
-    max_total_tokens: int = 256,
-    chunk_tokens: int = 64,
-    base_temperature: float = 0.2,
-    punkd_profile: str = "balanced",
+    max_total_tokens: int = 64,
+    chunk_tokens: int = 16,
+    base_temperature: float = 0.10,
+    punkd_profile: str = "conservative",
     streaming_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     assembled = ""
@@ -571,6 +606,7 @@ def chunked_generate(
         patched_prompt, mult = punkd_apply(cur_prompt, token_weights, profile=punkd_profile)
         temp = max(0.01, min(2.0, base_temperature * mult))
         out = llm(patched_prompt, max_tokens=chunk_tokens, temperature=temp)
+
         text = ""
         if isinstance(out, dict):
             try:
@@ -578,13 +614,12 @@ def chunked_generate(
             except Exception:
                 text = out.get("text", "")
         else:
-            try:
-                text = str(out)
-            except Exception:
-                text = ""
+            text = str(out or "")
+
         text = (text or "").strip()
         if not text:
             break
+
         overlap = 0
         max_ol = min(30, len(prev_tail), len(text))
         for olen in range(max_ol, 0, -1):
@@ -594,122 +629,134 @@ def chunked_generate(
         append_text = text[overlap:] if overlap else text
         assembled += append_text
         prev_tail = assembled[-120:] if len(assembled) > 120 else assembled
+
         if streaming_callback:
             streaming_callback(append_text)
+
         m = re.search(r"\b(Low|Medium|High)\b", assembled, re.IGNORECASE)
         if m:
             break
+
         if len(text.split()) < max(4, chunk_tokens // 8):
             break
+
         cur_prompt = prompt + "\n\nAssistant so far:\n" + assembled + "\n\nContinue:"
     return assembled.strip()
 
-def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -> str:
-    entropy_text = "entropic_score=unknown"
-    if include_system_entropy:
-        metrics = collect_system_metrics()
-        rgb = metrics_to_rgb(metrics)
-        score = pennylane_entropic_score(rgb)
-        entropy_text = entropic_summary_text(score)
-        metrics_line = "sys_metrics: cpu={cpu:.2f},mem={mem:.2f},load={load1:.2f},temp={temp:.2f},proc={proc:.2f}".format(
-            cpu=metrics.get("cpu", 0.0),
-            mem=metrics.get("mem", 0.0),
-            load1=metrics.get("load1", 0.0),
-            temp=metrics.get("temp", 0.0),
-            proc=metrics.get("proc", 0.0),
-        )
-    else:
-        metrics_line = "sys_metrics: disabled"
-    return (
-        "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
-        "Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
-        "Your reply must be only one word: Low, Medium, or High.\n\n"
-        "[tuning]\n"
-        "Scene details:\n"
-        f"Location: {data.get('location','unspecified location')}\n"
-        f"Road type: {data.get('road_type','unknown')}\n"
-        f"Weather: {data.get('weather','unknown')}\n"
-        f"Traffic: {data.get('traffic','unknown')}\n"
-        f"Obstacles: {data.get('obstacles','none')}\n"
-        f"Sensor notes: {data.get('sensor_notes','none')}\n"
-        f"{metrics_line}\n"
-        f"Quantum State: {entropy_text}\n"
-        "[/tuning]\n\n"
-        "Follow these strict rules when forming your decision:\n"
-        "- Think through all scene factors internally but do not show reasoning.\n"
-        "- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
-        "- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
-        "- Choose only one risk level that best fits the entire situation.\n"
-        "- Output exactly one word, with no punctuation or labels.\n"
-        "- The valid outputs are only: Low, Medium, High.\n\n"
-        "[action]\n"
-        "1) Normalize sensor inputs to comparable scales.\n"
-        "3) Map environmental risk cues -> discrete label using conservative thresholds.\n"
-        "4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
-        "5) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
-        "6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
-        "[/action]\n\n"
-        "[replytemplate]\n"
-        "Low | Medium | High\n"
-        "[/replytemplate]"
+
+# ---------------------------
+# llama_cpp inference for med risk
+# ---------------------------
+def load_llama(model_path: Path):
+    from llama_cpp import Llama  # type: ignore
+    try:
+        c = os.cpu_count() or 1
+    except Exception:
+        c = 1
+    threads = 2 if c >= 2 else 1
+    return Llama(
+        model_path=str(model_path),
+        n_ctx=768,
+        n_threads=threads,
+        n_batch=64,
+        use_mmap=False,
+        use_mlock=False,
+        n_gpu_layers=0,
+        verbose=False,
     )
 
-def _heuristic_fallback(data: dict) -> str:
-    txt = " ".join([str(v or "") for v in data.values()]).lower()
-    if any(w in txt for w in ["ice", "snow", "fog", "flood", "whiteout", "hail", "blizzard"]):
-        return "High"
-    if "high" in txt and "traffic" in txt:
-        return "High"
-    if any(w in txt for w in ["construction", "debris", "pedestrian", "animal", "accident"]):
-        return "High"
-    if any(w in txt for w in ["rain", "wet"]) or any(w in txt for w in ["medium", "med"]):
-        return "Medium"
-    return "Low"
 
-def run_scan_blocking(data: dict) -> Tuple[str, str]:
-    prompt = build_road_scanner_prompt(data, include_system_entropy=True)
+def build_med_risk_prompt(med: Dict[str, Any], dose_mg: float, now_ts: float) -> str:
+    name = str(med.get("name") or "Medication")
+    interval_h = float(med.get("interval_hours") or 0.0)
+    max_daily = float(med.get("max_daily_mg") or 0.0)
+    last = float(med.get("last_taken_ts") or 0.0)
+    mins_since = (now_ts - last) / 60.0 if last > 0 else 999999.0
+
+    cutoff = now_ts - 24 * 3600.0
+    hist = list(med.get("history") or [])
+    total_24h = 0.0
+    for item in hist:
+        try:
+            ts = float(item[0]); mg = float(item[1])
+            if ts >= cutoff:
+                total_24h += mg
+        except Exception:
+            continue
+    projected = total_24h + max(0.0, float(dose_mg))
+
+    return (
+        "ROLE\n"
+        "You are a medication reminder safety classifier.\n"
+        "Return ONLY one word: Low, Medium, or High.\n\n"
+        "RULES\n"
+        "- Output exactly one word: Low or Medium or High.\n"
+        "- Be conservative if uncertain.\n"
+        "- High if dose is too soon or exceeds daily max.\n"
+        "- Medium if close to interval or close to daily max.\n"
+        "- Low otherwise.\n\n"
+        "DATA\n"
+        f"med_name: {name}\n"
+        f"dose_mg: {dose_mg}\n"
+        f"interval_hours: {interval_h}\n"
+        f"minutes_since_last_dose: {mins_since:.1f}\n"
+        f"max_daily_mg: {max_daily}\n"
+        f"total_last_24h_mg: {total_24h:.1f}\n"
+        f"projected_24h_total_mg_if_taken: {projected:.1f}\n\n"
+        "OUTPUT\n"
+        "Low | Medium | High\n"
+    )
+
+
+def run_med_scan_blocking(model_mgr: ModelManager, med: Dict[str, Any], dose_mg: float) -> Tuple[str, str]:
+    now_ts = _now()
+    if not model_mgr.is_ready():
+        lvl, msg = dose_safety_level(med, dose_mg, now_ts)
+        return lvl, f"[fallback] {msg}"
+
+    prompt = build_med_risk_prompt(med, dose_mg, now_ts)
     out_text = ""
-    with acquire_plain_model() as mp:
+
+    with model_mgr.acquire_plain_model() as mp:
         llm = load_llama(mp)
         try:
             out_text = chunked_generate(
                 llm,
                 prompt,
-                max_total_tokens=96,
-                chunk_tokens=24,
-                base_temperature=0.18,
-                punkd_profile="balanced",
-                streaming_callback=None,
+                max_total_tokens=48,
+                chunk_tokens=16,
+                base_temperature=0.10,
+                punkd_profile="conservative",
             )
         finally:
             try:
                 llm.close()
             except Exception:
                 pass
-            try:
-                del llm
-            except Exception:
-                pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
-            time.sleep(0.03)
+
     m = re.search(r"\b(low|medium|high)\b", out_text, re.IGNORECASE)
     label = m.group(1).capitalize() if m else ""
     if label not in ("Low", "Medium", "High"):
-        label = _heuristic_fallback(data)
-    return label, out_text
+        lvl, msg = dose_safety_level(med, dose_mg, now_ts)
+        return lvl, f"[fallback] {msg} / raw={out_text[:120]}"
+    return label, out_text.strip()
 
+
+# ---------------------------
+# UI widgets (wheel + cards)
+# ---------------------------
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.08, 0.10, 0.16, 1])
     bottom_color = ListProperty([0.02, 0.03, 0.05, 1])
     steps = NumericProperty(56)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, top_color=self._redraw, bottom_color=self._redraw, steps=self._redraw)
+
     def _lerp(self, a, b, t):
         return a + (b - a) * t
+
     def _redraw(self, *args):
         self.canvas.before.clear()
         x, y = self.pos
@@ -725,14 +772,17 @@ class BackgroundGradient(Widget):
                 Color(r, g, b, a)
                 Rectangle(pos=(x, y + (h * i / n)), size=(w, h / n + 1))
 
+
 class GlassCard(Widget):
     radius = NumericProperty(dp(28))
     fill = ListProperty([1, 1, 1, 0.06])
     border = ListProperty([1, 1, 1, 0.14])
     highlight = ListProperty([1, 1, 1, 0.09])
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, radius=self._redraw, fill=self._redraw, border=self._redraw, highlight=self._redraw)
+
     def _redraw(self, *args):
         self.canvas.clear()
         x, y = self.pos
@@ -748,12 +798,15 @@ class GlassCard(Widget):
             Color(*self.border)
             Line(rounded_rectangle=[x, y, w, h, r], width=dp(1.15))
 
+
 class StatusPill(Widget):
     text = StringProperty("Neutral")
     tone = StringProperty("neutral")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, text=self._redraw, tone=self._redraw)
+
     def _tone_rgba(self):
         if self.tone == "good":
             return (0.10, 0.90, 0.42, 0.22)
@@ -762,6 +815,7 @@ class StatusPill(Widget):
         if self.tone == "bad":
             return (0.98, 0.22, 0.30, 0.22)
         return (1, 1, 1, 0.10)
+
     def _tone_line(self):
         if self.tone == "good":
             return (0.10, 0.90, 0.42, 0.30)
@@ -770,6 +824,7 @@ class StatusPill(Widget):
         if self.tone == "bad":
             return (0.98, 0.22, 0.30, 0.30)
         return (1, 1, 1, 0.16)
+
     def _redraw(self, *args):
         self.canvas.clear()
         x, y = self.pos
@@ -785,13 +840,16 @@ class StatusPill(Widget):
             Color(*ln)
             Line(rounded_rectangle=[x, y, w, h, r], width=dp(1.1))
 
+
 class RiskWheelNeo(Widget):
     value = NumericProperty(0.5)
     level = StringProperty("NEUTRAL")
     animated = BooleanProperty(True)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, level=self._redraw)
+
     def set_level(self, level: str, animate: bool = True):
         lvl = (level or "").strip().upper()
         if lvl == "LOW":
@@ -808,6 +866,7 @@ class RiskWheelNeo(Widget):
             Animation(value=float(target_value), d=0.35, t="out_cubic").start(self)
         else:
             self.value = float(target_value)
+
     def _level_color(self):
         if self.level == "LOW":
             return (0.10, 0.90, 0.42)
@@ -816,8 +875,10 @@ class RiskWheelNeo(Widget):
         if self.level == "MEDIUM":
             return (0.98, 0.78, 0.20)
         return (0.78, 0.82, 0.90)
+
     def _seg_alpha(self):
         return 0.58 if self.level == "NEUTRAL" else 0.80
+
     def _redraw(self, *args):
         self.canvas.clear()
         cx, cy = self.center
@@ -856,6 +917,10 @@ class RiskWheelNeo(Widget):
             Color(0.06, 0.07, 0.10, 0.92)
             RoundedRectangle(pos=(cx - dp(12), cy - dp(12)), size=(dp(24), dp(24)), radius=[dp(12)])
 
+
+# ---------------------------
+# KV
+# ---------------------------
 KV_TEMPLATE = r"""
 #:import dp kivy.metrics.dp
 
@@ -875,16 +940,17 @@ MDScreen:
         spacing: "0dp"
 
         APPBAR_WIDGET:
-            title: "Road Safe"
+            title: "MedSafe"
             elevation: 8
-            right_action_items: [["information-outline", lambda x: app.switch_screen("about")], ["shield-lock-outline", lambda x: app.switch_screen("privacy")]]
+            right_action_items: [["bell-outline", lambda x: app.request_notif_permission()],
+                                 ["refresh", lambda x: app.refresh_meds()]]
 
         ScreenManager:
             id: screen_manager
             size_hint_y: 1
 
             MDScreen:
-                name: "road"
+                name: "meds"
                 BackgroundGradient:
                     top_color: 0.08, 0.10, 0.16, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
@@ -900,7 +966,7 @@ MDScreen:
 
                         FloatLayout:
                             size_hint_y: None
-                            height: card_body.minimum_height + dp(34)
+                            height: header_body.minimum_height + dp(34)
 
                             GlassCard:
                                 pos: self.pos
@@ -908,13 +974,13 @@ MDScreen:
                                 radius: dp(28)
 
                             MDBoxLayout:
-                                id: card_body
+                                id: header_body
                                 orientation: "vertical"
                                 size_hint: 1, None
                                 height: self.minimum_height
                                 pos: self.parent.pos
                                 padding: "18dp"
-                                spacing: "14dp"
+                                spacing: "12dp"
 
                                 MDBoxLayout:
                                     size_hint_y: None
@@ -922,7 +988,7 @@ MDScreen:
                                     spacing: "10dp"
 
                                     MDLabel:
-                                        text: "Road Risk Scanner"
+                                        text: "Dose Safety / Reminder Risk"
                                         bold: True
                                         font_style: "H6"
                                         halign: "left"
@@ -965,23 +1031,9 @@ MDScreen:
                                     theme_text_color: "Custom"
                                     text_color: 0.90, 0.92, 0.96, 0.95
 
-                                MDTextField:
-                                    id: loc_field
-                                    hint_text: "Location"
-                                    mode: "fill"
-                                    helper_text_mode: "on_focus"
-                                    helper_text: "Only input needed"
-                                    size_hint_x: 1
-
-                                MDRaisedButton:
-                                    id: scan_btn
-                                    text: "Scan Risk"
-                                    size_hint_x: 1
-                                    on_release: app.on_scan()
-
                                 MDLabel:
-                                    id: scan_result
-                                    text: ""
+                                    id: selected_text
+                                    text: "Selected: —"
                                     halign: "center"
                                     size_hint_y: None
                                     height: "22dp"
@@ -989,7 +1041,7 @@ MDScreen:
 
                         FloatLayout:
                             size_hint_y: None
-                            height: helper_body.minimum_height + dp(32)
+                            height: form_body.minimum_height + dp(34)
 
                             GlassCard:
                                 pos: self.pos
@@ -1000,262 +1052,113 @@ MDScreen:
                                 highlight: 1, 1, 1, 0.07
 
                             MDBoxLayout:
-                                id: helper_body
-                                orientation: "vertical"
-                                size_hint: 1, None
-                                height: self.minimum_height
-                                pos: self.parent.pos
-                                padding: "16dp"
-                                spacing: "10dp"
-
-                                MDLabel:
-                                    text: "What this does"
-                                    font_style: "Subtitle1"
-                                    bold: True
-                                    halign: "left"
-                                    theme_text_color: "Custom"
-                                    text_color: 0.90, 0.92, 0.96, 0.95
-                                    size_hint_y: None
-                                    height: "22dp"
-
-                                MDLabel:
-                                    text: "Runs an on-device model and returns a simple risk label. No accounts. No sign-in. No cloud calls."
-                                    halign: "left"
-                                    theme_text_color: "Secondary"
-                                    size_hint_y: None
-                                    height: self.texture_size[1] + dp(6)
-                                    text_size: self.width, None
-
-                                MDBoxLayout:
-                                    size_hint_y: None
-                                    height: "40dp"
-                                    spacing: "10dp"
-
-                                    MDFlatButton:
-                                        text: "How it works"
-                                        on_release: app.switch_screen("about")
-
-                                    MDFlatButton:
-                                        text: "Privacy policy"
-                                        on_release: app.switch_screen("privacy")
-
-            MDScreen:
-                name: "about"
-                BackgroundGradient:
-                    top_color: 0.07, 0.09, 0.14, 1
-                    bottom_color: 0.02, 0.03, 0.05, 1
-
-                ScrollView:
-                    do_scroll_x: False
-
-                    MDBoxLayout:
-                        orientation: "vertical"
-                        padding: "16dp"
-                        spacing: "16dp"
-                        adaptive_height: True
-
-                        FloatLayout:
-                            size_hint_y: None
-                            height: about_body.minimum_height + dp(34)
-
-                            GlassCard:
-                                pos: self.pos
-                                size: self.size
-                                radius: dp(28)
-
-                            MDBoxLayout:
-                                id: about_body
+                                id: form_body
                                 orientation: "vertical"
                                 size_hint: 1, None
                                 height: self.minimum_height
                                 pos: self.parent.pos
                                 padding: "18dp"
-                                spacing: "12dp"
+                                spacing: "10dp"
 
-                                MDLabel:
-                                    text: "Welcome to Road Safe"
-                                    font_style: "H5"
-                                    bold: True
-                                    halign: "left"
-                                    theme_text_color: "Custom"
-                                    text_color: 0.92, 0.94, 0.98, 0.96
-                                    size_hint_y: None
-                                    height: self.texture_size[1] + dp(2)
-                                    text_size: self.width, None
+                                MDTextField:
+                                    id: med_name
+                                    hint_text: "Medication name"
+                                    mode: "fill"
 
-                                MDLabel:
-                                    markup: True
-                                    text:
-                                        "[b]What you see[/b]\n"
-                                        "• A single input: [b]Location[/b]\n"
-                                        "• A dial that reports: [b]Low / Medium / High[/b]\n"
-                                        "• A neutral state before any scan is run\n"
-                                        "\n"
-                                        "[b]What happens when you scan[/b]\n"
-                                        "1) The app prepares an encrypted on-device model.\n"
-                                        "2) It runs a short inference and extracts one of the allowed labels.\n"
-                                        "3) If the output is malformed, a conservative heuristic chooses a label.\n"
-                                        "\n"
-                                        "[b]First-boot security (advanced)[/b]\n"
-                                        "• The shipped model is stored encrypted.\n"
-                                        "• On first boot, the app unwraps a model key using a bootstrap secret and immediately rotates to an install-specific key stored in private app storage.\n"
-                                        "• A temporary plaintext model file may be created during a scan and is deleted when scanning completes.\n"
-                                        "\n"
-                                        "[b]Operational behavior[/b]\n"
-                                        "• This app is designed to run offline.\n"
-                                        "• Results are an advisory risk label, not a guarantee.\n"
-                                        "• If you need safety-critical guidance, rely on official road/weather sources.\n"
-                                    halign: "left"
-                                    theme_text_color: "Secondary"
-                                    text_size: self.width, None
-                                    size_hint_y: None
-                                    height: self.texture_size[1] + dp(8)
+                                MDTextField:
+                                    id: dose_mg
+                                    hint_text: "Dose (mg) e.g. 200"
+                                    mode: "fill"
+                                    input_filter: "float"
+
+                                MDTextField:
+                                    id: interval_h
+                                    hint_text: "Interval hours e.g. 8"
+                                    mode: "fill"
+                                    input_filter: "float"
+
+                                MDTextField:
+                                    id: max_daily
+                                    hint_text: "Max daily mg (optional) e.g. 1200"
+                                    mode: "fill"
+                                    input_filter: "float"
 
                                 MDBoxLayout:
                                     size_hint_y: None
-                                    height: "44dp"
+                                    height: "46dp"
                                     spacing: "10dp"
 
                                     MDRaisedButton:
-                                        text: "Continue to Scanner"
+                                        text: "Save / Update"
                                         size_hint_x: 1
-                                        on_release: app.accept_about()
+                                        on_release: app.on_save_med()
+
+                                    MDRaisedButton:
+                                        text: "Log Dose Now"
+                                        size_hint_x: 1
+                                        on_release: app.on_log_dose()
 
                                 MDBoxLayout:
                                     size_hint_y: None
-                                    height: "40dp"
+                                    height: "46dp"
                                     spacing: "10dp"
 
                                     MDFlatButton:
-                                        text: "Read Privacy Policy"
-                                        on_release: app.switch_screen("privacy")
+                                        text: "Delete"
+                                        on_release: app.on_delete_med()
+
+                                    Widget:
+
+                                    MDRaisedButton:
+                                        text: "Start Background Reminders"
+                                        on_release: app.start_bg_service()
+
+                                MDBoxLayout:
+                                    size_hint_y: None
+                                    height: "46dp"
+                                    spacing: "10dp"
+
+                                    MDRaisedButton:
+                                        text: "Stop Background Reminders"
+                                        on_release: app.stop_bg_service()
 
                                     Widget:
 
                                     MDFlatButton:
-                                        text: "Go to Scan"
-                                        on_release: app.switch_screen("road")
+                                        text: "Refresh"
+                                        on_release: app.refresh_meds()
 
-            MDScreen:
-                name: "privacy"
-                BackgroundGradient:
-                    top_color: 0.06, 0.08, 0.13, 1
-                    bottom_color: 0.02, 0.03, 0.05, 1
-
-                ScrollView:
-                    do_scroll_x: False
-
-                    MDBoxLayout:
-                        orientation: "vertical"
-                        padding: "16dp"
-                        spacing: "16dp"
-                        adaptive_height: True
+                                MDLabel:
+                                    id: action_result
+                                    text: ""
+                                    halign: "center"
+                                    size_hint_y: None
+                                    height: "42dp"
+                                    theme_text_color: "Secondary"
+                                    text_size: self.width, None
+                                    valign: "middle"
 
                         FloatLayout:
                             size_hint_y: None
-                            height: privacy_body.minimum_height + dp(34)
+                            height: list_body.minimum_height + dp(34)
 
                             GlassCard:
                                 pos: self.pos
                                 size: self.size
                                 radius: dp(28)
-                                fill: 1, 1, 1, 0.055
-                                border: 1, 1, 1, 0.14
-                                highlight: 1, 1, 1, 0.09
 
                             MDBoxLayout:
-                                id: privacy_body
+                                id: list_body
                                 orientation: "vertical"
                                 size_hint: 1, None
                                 height: self.minimum_height
                                 pos: self.parent.pos
                                 padding: "18dp"
-                                spacing: "12dp"
-
-                                MDLabel:
-                                    text: "Privacy Policy"
-                                    font_style: "H5"
-                                    bold: True
-                                    halign: "left"
-                                    theme_text_color: "Custom"
-                                    text_color: 0.92, 0.94, 0.98, 0.96
-                                    size_hint_y: None
-                                    height: self.texture_size[1] + dp(2)
-                                    text_size: self.width, None
-
-                                MDLabel:
-                                    markup: True
-                                    text:
-                                        "[b]Summary[/b]\n"
-                                        "Road Safe is built for offline use. It does not require an account and is designed to avoid transmitting your data.\n"
-                                        "\n"
-                                        "[b]Data you provide[/b]\n"
-                                        "• Location text you type into the app (free-form).\n"
-                                        "• Optional diagnostic actions you trigger (e.g., opening the Debug tab).\n"
-                                        "\n"
-                                        "[b]Data processing[/b]\n"
-                                        "• Your input is used to build a prompt and run a local model inference.\n"
-                                        "• The app shows only a risk label (Low/Medium/High) plus UI state.\n"
-                                        "\n"
-                                        "[b]Network / sharing[/b]\n"
-                                        "• The app does not intentionally upload your location or scan results.\n"
-                                        "• No analytics SDK is required for the core scanner flow.\n"
-                                        "\n"
-                                        "[b]Local storage[/b]\n"
-                                        "The app may store:\n"
-                                        "• Encrypted key material used to unwrap the model key after first boot (private app storage).\n"
-                                        "• A debug log file that records technical events and errors (private app storage).\n"
-                                        "• Temporary model artifacts during a scan. These are deleted when the scan ends.\n"
-                                        "\n"
-                                        "[b]Debug log[/b]\n"
-                                        "• The log may contain device/platform information, file paths within private storage, and error traces.\n"
-                                        "• Avoid entering sensitive personal data into the Location field if you plan to export/share logs.\n"
-                                        "\n"
-                                        "[b]Your choices[/b]\n"
-                                        "• You can clear the debug log inside the Debug page.\n"
-                                        "• You control what you type into Location.\n"
-                                        "\n"
-                                        "[b]Safety note[/b]\n"
-                                        "Risk labels are informational. Always prioritize official road conditions and your direct observations.\n"
-                                    halign: "left"
-                                    theme_text_color: "Secondary"
-                                    text_size: self.width, None
-                                    size_hint_y: None
-                                    height: self.texture_size[1] + dp(8)
-
-                                MDBoxLayout:
-                                    size_hint_y: None
-                                    height: "44dp"
-                                    spacing: "10dp"
-
-                                    MDRaisedButton:
-                                        text: "Back to Scan"
-                                        size_hint_x: 1
-                                        on_release: app.switch_screen("road")
-
-                        FloatLayout:
-                            size_hint_y: None
-                            height: privacy_footer.minimum_height + dp(28)
-
-                            GlassCard:
-                                pos: self.pos
-                                size: self.size
-                                radius: dp(28)
-                                fill: 1, 1, 1, 0.04
-                                border: 1, 1, 1, 0.10
-                                highlight: 1, 1, 1, 0.06
-
-                            MDBoxLayout:
-                                id: privacy_footer
-                                orientation: "vertical"
-                                size_hint: 1, None
-                                height: self.minimum_height
-                                pos: self.parent.pos
-                                padding: "16dp"
                                 spacing: "10dp"
+                                adaptive_height: True
 
                                 MDLabel:
-                                    text: "Local files"
+                                    text: "Medications"
                                     bold: True
                                     font_style: "Subtitle1"
                                     halign: "left"
@@ -1264,13 +1167,13 @@ MDScreen:
                                     size_hint_y: None
                                     height: "22dp"
 
-                                MDLabel:
-                                    text: "Base directory: " + app.base_dir_str
-                                    halign: "left"
-                                    theme_text_color: "Secondary"
+                                ScrollView:
                                     size_hint_y: None
-                                    height: self.texture_size[1] + dp(6)
-                                    text_size: self.width, None
+                                    height: "260dp"
+                                    do_scroll_x: False
+
+                                    MDList:
+                                        id: med_list
 
             MDScreen:
                 name: "debug"
@@ -1278,40 +1181,28 @@ MDScreen:
                     top_color: 0.06, 0.08, 0.13, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
 
-                MDBoxLayout:
-                    orientation: "vertical"
-                    padding: "12dp"
-                    spacing: "10dp"
-
+                ScrollView:
+                    do_scroll_x: False
                     MDBoxLayout:
-                        size_hint_y: None
-                        height: "44dp"
-                        spacing: "8dp"
+                        orientation: "vertical"
+                        padding: "14dp"
+                        spacing: "10dp"
+                        adaptive_height: True
 
-                        MDLabel:
-                            id: debug_meta
-                            text: "—"
-                            theme_text_color: "Secondary"
-                            halign: "left"
+                        GlassCard:
+                            size_hint_y: None
+                            height: debug_text.texture_size[1] + dp(40)
+                            radius: dp(28)
 
-                        Widget:
-
-                        MDIconButton:
-                            icon: "delete-outline"
-                            on_release: app.gui_debug_clear()
-
-                        MDIconButton:
-                            icon: "refresh"
-                            on_release: app.gui_debug_refresh()
-
-                    ScrollView:
                         MDLabel:
                             id: debug_text
                             text: ""
+                            theme_text_color: "Secondary"
+                            halign: "left"
                             markup: False
-                            size_hint_y: None
                             text_size: self.width, None
-                            height: self.texture_size[1] + dp(12)
+                            size_hint_y: None
+                            height: self.texture_size[1] + dp(20)
 
         MDBottomNavigation:
             id: bottom_nav
@@ -1319,22 +1210,10 @@ MDScreen:
             height: "72dp"
 
             MDBottomNavigationItem:
-                name: "nav_scan"
-                text: "Scan"
-                icon: "radar"
-                on_tab_press: app.switch_screen("road")
-
-            MDBottomNavigationItem:
-                name: "nav_about"
-                text: "About"
-                icon: "information-outline"
-                on_tab_press: app.switch_screen("about")
-
-            MDBottomNavigationItem:
-                name: "nav_privacy"
-                text: "Privacy"
-                icon: "shield-lock-outline"
-                on_tab_press: app.switch_screen("privacy")
+                name: "nav_meds"
+                text: "Meds"
+                icon: "pill"
+                on_tab_press: app.switch_screen("meds")
 
             MDBottomNavigationItem:
                 name: "nav_debug"
@@ -1342,80 +1221,47 @@ MDScreen:
                 icon: "bug-outline"
                 on_tab_press: app.switch_screen("debug")
 """
-
 KV = KV_TEMPLATE.replace("APPBAR_WIDGET", _APPBAR_NAME)
 
-def _is_first_boot() -> bool:
-    _require_paths()
-    try:
-        return not FIRST_BOOT_FLAG_PATH.exists()
-    except Exception:
-        return True
 
-def _mark_first_boot_done():
-    _require_paths()
-    try:
-        _atomic_write(FIRST_BOOT_FLAG_PATH, b"1")
-    except Exception:
-        pass
-
-class SecureLLMApp(MDApp):
-    _debug_dirty = False
+# ---------------------------
+# App
+# ---------------------------
+class MedSafeApp(MDApp):
     safe_top = NumericProperty(0)
-    _scan_lock = threading.Lock()
-    _scan_inflight = False
-    base_dir_str = StringProperty("")
+
     _exec: Optional[ThreadPoolExecutor] = None
+    _selected_med_id: Optional[str] = None
 
-    def _init_paths(self):
-        global BASE_DIR, TMP_DIR, INSTALL_MASTER_PATH, INSTALL_MDK_WRAP_PATH, FIRST_BOOT_FLAG_PATH, LOG_PATH
-        ud = Path(self.user_data_dir)
-        BASE_DIR = ud / "qroadscan_data"
-        BASE_DIR.mkdir(parents=True, exist_ok=True)
-        TMP_DIR = BASE_DIR / "tmp"
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
-        INSTALL_MASTER_PATH = BASE_DIR / ".install_master_key"
-        INSTALL_MDK_WRAP_PATH = BASE_DIR / ".mdk.wrap.install"
-        FIRST_BOOT_FLAG_PATH = BASE_DIR / ".first_boot_done"
-        LOG_PATH = BASE_DIR / "debug.log"
-        self.base_dir_str = str(BASE_DIR)
-
-    def _cleanup_tmp(self):
-        try:
-            _require_paths()
-            if TMP_DIR is None or not TMP_DIR.exists():
-                return
-            for p in TMP_DIR.glob("model_plain.*.gguf"):
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    _files_dir: Optional[Path] = None
+    _vault: Optional[Vault] = None
+    _model_mgr: Optional[ModelManager] = None
 
     def build(self):
-        self.title = "Road Safe"
+        self.title = "MedSafe"
         self.theme_cls.theme_style = "Dark"
         self.theme_cls.primary_palette = "Blue"
         self.safe_top = dp(24) if _kivy_platform == "android" else 0
-        self._init_paths()
-        self._cleanup_tmp()
-        self._exec = ThreadPoolExecutor(max_workers=1)
-        return Builder.load_string(KV)
 
-    def on_start(self):
-        logger.info("app start platform=%s base=%s", _kivy_platform, str(BASE_DIR) if BASE_DIR else "—")
-        logger.info("pkg=%s shipped_models=%s", str(PKG_DIR), str(MODELS_SHIPPED))
-        logger.info("model_enc=%s boot_wrap=%s sha=%s", str(MODEL_ENC_PATH), str(MODEL_BOOT_WRAP_PATH), str(MODEL_SHA_PATH))
-        try:
-            import llama_cpp  # noqa
-            logger.info("LLAMA: module import OK")
-        except Exception as e:
-            logger.exception("LLAMA: module import FAILED: %s", e)
-        Clock.schedule_once(lambda dt: self.reset_ui(), 0.0)
-        Clock.schedule_once(lambda dt: self.gui_debug_refresh(), 0.2)
-        Clock.schedule_interval(self._debug_auto_refresh, 0.6)
-        Clock.schedule_once(lambda dt: self._route_first_boot(), 0.0)
+        self._exec = ThreadPoolExecutor(max_workers=1)
+
+        if _kivy_platform == "android":
+            self._files_dir = _android_files_dir()
+            if self._files_dir is None:
+                # fallback: user_data_dir on some stacks
+                self._files_dir = Path(self.user_data_dir)
+        else:
+            self._files_dir = Path.home() / ".medsafe_files"
+            self._files_dir.mkdir(parents=True, exist_ok=True)
+
+        self._vault = Vault(self._files_dir)
+        self._model_mgr = ModelManager(self._files_dir)
+        self._model_mgr.cleanup_tmp()
+
+        root = Builder.load_string(KV)
+        Clock.schedule_once(lambda dt: self.refresh_meds(), 0.1)
+        Clock.schedule_once(lambda dt: self._kick_model_download(), 0.2)
+        return root
 
     def on_stop(self):
         try:
@@ -1424,24 +1270,28 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
 
-    def _route_first_boot(self):
+    # ---- UI helpers ----
+    def _pill(self, tone: str, text: str):
         try:
-            if _is_first_boot():
-                self.switch_screen("about")
-            else:
-                self.switch_screen("road")
+            scr = self.root.ids.screen_manager.get_screen("meds")
+            scr.ids.status_pill.tone = tone
+            scr.ids.status_pill_text.text = text
         except Exception:
-            self.switch_screen("road")
+            pass
 
-    def accept_about(self):
-        _mark_first_boot_done()
-        self.switch_screen("road")
-
-    def _debug_auto_refresh(self, *args):
+    def _set_risk_ui(self, lvl: str):
         try:
-            if self.root.ids.screen_manager.current == "debug" or self._debug_dirty:
-                self._debug_dirty = False
-                self.gui_debug_refresh()
+            scr = self.root.ids.screen_manager.get_screen("meds")
+            scr.ids.risk_wheel.set_level(lvl, animate=True)
+            scr.ids.risk_text.text = "RISK: —" if (lvl or "").lower() == "neutral" else f"RISK: {lvl.upper()}"
+        except Exception:
+            pass
+
+    def request_notif_permission(self):
+        if request_permissions is None or Permission is None:
+            return
+        try:
+            request_permissions([Permission.POST_NOTIFICATIONS])
         except Exception:
             pass
 
@@ -1451,109 +1301,371 @@ class SecureLLMApp(MDApp):
         except Exception:
             pass
         if name == "debug":
-            self.gui_debug_refresh()
+            self.render_debug()
 
-    def _pill(self, tone: str, text: str):
+    def render_debug(self):
         try:
-            road = self.root.ids.screen_manager.get_screen("road")
-            road.ids.status_pill.tone = tone
-            road.ids.status_pill_text.text = text
-        except Exception:
-            pass
-
-    def reset_ui(self):
-        try:
-            road = self.root.ids.screen_manager.get_screen("road")
-            road.ids.risk_wheel.set_level("Neutral", animate=False)
-            road.ids.risk_text.text = "RISK: —"
-            road.ids.scan_result.text = ""
-            road.ids.scan_btn.disabled = False
-            road.ids.scan_btn.text = "Scan Risk"
-            self._pill("neutral", "Neutral")
-        except Exception:
-            pass
-        self._scan_inflight = False
-
-    def on_scan(self):
-        if self._scan_inflight or self._exec is None:
-            return
-        with self._scan_lock:
-            if self._scan_inflight:
+            v = self._vault
+            mm = self._model_mgr
+            if not v or not mm:
+                self.root.ids.debug_text.text = "not ready"
                 return
-            self._scan_inflight = True
-        road = self.root.ids.screen_manager.get_screen("road")
-        try:
-            road.ids.scan_btn.disabled = True
-            road.ids.scan_btn.text = "Scanning..."
-            road.ids.scan_result.text = ""
-            road.ids.risk_text.text = "RISK: —"
-            road.ids.risk_wheel.set_level("Neutral", animate=True)
-            self._pill("warn", "Running")
+            self.root.ids.debug_text.text = (
+                f"platform: {_kivy_platform}\n"
+                f"files_dir: {self._files_dir}\n"
+                f"vault_dir: {v.base}\n"
+                f"meds_file: {v.meds_path} (exists={v.meds_path.exists()})\n"
+                f"model_enc: {mm.model_enc_path} (exists={mm.model_enc_path.exists()})\n"
+                f"model_sha: {mm.model_sha_path} (exists={mm.model_sha_path.exists()})\n"
+                f"selected_med_id: {self._selected_med_id}\n"
+            )
         except Exception:
             pass
-        data = {
-            "location": (road.ids.loc_field.text or "").strip() or "unspecified location",
-            "road_type": "unknown",
-            "weather": "unknown",
-            "traffic": "unknown",
-            "obstacles": "none",
-            "sensor_notes": "none",
-        }
-        scan_id = uuid.uuid4().hex[:10]
-        logger.info("SCAN_UI: clicked id=%s", scan_id)
-        fut = self._exec.submit(run_scan_blocking, data)
-        fut.add_done_callback(lambda f: self._scan_done_callback(f, scan_id))
 
-    def _scan_done_callback(self, fut, scan_id: str):
-        try:
-            label, raw = fut.result()
-        except Exception as e:
-            logger.exception("SCAN: failed id=%s", scan_id)
-            label, raw = "", f"[Error] {e}"
-        Clock.schedule_once(lambda dt: self._scan_finish(label, raw, scan_id), 0)
+    # ---- Model auto-download ----
+    def _kick_model_download(self):
+        if not self._exec or not self._model_mgr:
+            return
+        if self._model_mgr.is_ready():
+            self._pill("good", "Ready")
+            self._set_risk_ui("Neutral")
+            try:
+                scr = self.root.ids.screen_manager.get_screen("meds")
+                scr.ids.action_result.text = "Model ready (offline)."
+            except Exception:
+                pass
+            return
 
-    def _scan_finish(self, label: str, raw: str, scan_id: str):
-        road = self.root.ids.screen_manager.get_screen("road")
-        lvl = (label or "").strip().capitalize()
-        if lvl not in ("Low", "Medium", "High"):
-            lvl = "Neutral"
+        self._pill("warn", "Working")
         try:
-            road.ids.risk_wheel.set_level(lvl, animate=True)
-            road.ids.risk_text.text = "RISK: —" if lvl == "Neutral" else f"RISK: {lvl.upper()}"
-            road.ids.scan_result.text = "" if lvl == "Neutral" else lvl
-            if lvl == "Low":
-                self._pill("good", "Low")
-            elif lvl == "Medium":
-                self._pill("warn", "Medium")
-            elif lvl == "High":
-                self._pill("bad", "High")
+            scr = self.root.ids.screen_manager.get_screen("meds")
+            scr.ids.action_result.text = "Checking/downloading model…"
+        except Exception:
+            pass
+
+        fut = self._exec.submit(self._ensure_model_ready_bg)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._model_done_ui(f), 0))
+
+    def _ensure_model_ready_bg(self):
+        assert self._model_mgr is not None
+
+        def progress(got: int, total: int):
+            if total > 0:
+                pct = int((got / max(1, total)) * 100)
+                Clock.schedule_once(lambda dt: self._model_progress_ui(f"Downloading model… {pct}%"), 0)
             else:
-                self._pill("neutral", "Neutral")
-        except Exception:
-            pass
-        try:
-            road.ids.scan_btn.disabled = False
-            road.ids.scan_btn.text = "Scan Risk"
-        except Exception:
-            pass
-        self._scan_inflight = False
-        logger.info("SCAN_UI: done id=%s label=%s raw=%s", scan_id, lvl, (raw or "")[:220].replace("\n", " "))
+                Clock.schedule_once(lambda dt: self._model_progress_ui(f"Downloading model… {got//1024//1024}MB"), 0)
 
-    def gui_debug_refresh(self):
+        self._model_mgr.ensure_ready(progress_cb=progress)
+        return True
+
+    def _model_progress_ui(self, text: str):
         try:
-            meta = f"file={'YES' if (LOG_PATH and LOG_PATH.exists()) else 'no'} | path={str(LOG_PATH) if LOG_PATH else '—'}"
-            self.root.ids.debug_meta.text = meta
-            self.root.ids.debug_text.text = _read_log_tail()
+            scr = self.root.ids.screen_manager.get_screen("meds")
+            scr.ids.action_result.text = text
         except Exception:
             pass
 
-    def gui_debug_clear(self):
+    def _model_done_ui(self, fut):
         try:
-            if LOG_PATH and LOG_PATH.exists():
-                LOG_PATH.unlink()
+            fut.result()
+            self._pill("good", "Ready")
+            try:
+                scr = self.root.ids.screen_manager.get_screen("meds")
+                scr.ids.action_result.text = "Model ready (offline)."
+            except Exception:
+                pass
+        except Exception as e:
+            self._pill("bad", "Model Err")
+            try:
+                scr = self.root.ids.screen_manager.get_screen("meds")
+                scr.ids.action_result.text = f"Model download failed: {e}"
+            except Exception:
+                pass
+
+    # ---- Med list refresh ----
+    def refresh_meds(self):
+        if not self._exec or not self._vault:
+            return
+        fut = self._exec.submit(self._vault.load)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._refresh_ui_from_vault(f), 0))
+
+    def _refresh_ui_from_vault(self, fut):
+        try:
+            data = fut.result()
+        except Exception:
+            data = {"version": 1, "meds": []}
+
+        meds = list(data.get("meds") or [])
+        now_ts = _now()
+
+        try:
+            scr = self.root.ids.screen_manager.get_screen("meds")
+            scr.ids.med_list.clear_widgets()
+
+            def _sort_key(m):
+                dm = due_minutes(m, now_ts)
+                if dm is None:
+                    return (999999, 999999)
+                # overdue first (bigger dm first)
+                return (0, -dm) if dm >= 0 else (1, abs(dm))
+
+            meds_sorted = sorted(meds, key=_sort_key)
+
+            for med in meds_sorted:
+                mid = str(med.get("id") or "")
+                name = str(med.get("name") or "Medication")
+                dm = due_minutes(med, now_ts)
+                if dm is None:
+                    status = "No schedule"
+                else:
+                    if dm >= 0:
+                        status = f"Due ({due_level(dm)}) • overdue {int(dm)} min"
+                    else:
+                        status = f"Next in {int(abs(dm))} min"
+
+                item = OneLineListItem(
+                    text=f"{name} — {status}",
+                    on_release=(lambda _x, _mid=mid: self.select_med(_mid)),
+                )
+                scr.ids.med_list.add_widget(item)
+
+            # keep selection valid
+            if self._selected_med_id and not any(str(m.get("id")) == self._selected_med_id for m in meds):
+                self._selected_med_id = None
+
+            self._render_selected(data)
         except Exception:
             pass
-        self.gui_debug_refresh()
+
+    def _render_selected(self, data: Dict[str, Any]):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        meds = list(data.get("meds") or [])
+        sel = None
+        if self._selected_med_id:
+            for m in meds:
+                if str(m.get("id") or "") == self._selected_med_id:
+                    sel = m
+                    break
+
+        if not sel:
+            scr.ids.selected_text.text = "Selected: —"
+            return
+
+        scr.ids.selected_text.text = f"Selected: {sel.get('name','—')}"
+        scr.ids.med_name.text = str(sel.get("name") or "")
+        scr.ids.dose_mg.text = str(sel.get("dose_mg") or "")
+        scr.ids.interval_h.text = str(sel.get("interval_hours") or "")
+        scr.ids.max_daily.text = str(sel.get("max_daily_mg") or "")
+
+    def select_med(self, med_id: str):
+        self._selected_med_id = med_id
+        self.refresh_meds()
+
+    # ---- Save / Delete / Log dose ----
+    def on_save_med(self):
+        if not self._vault or not self._exec:
+            return
+        scr = self.root.ids.screen_manager.get_screen("meds")
+
+        name = (scr.ids.med_name.text or "").strip()
+        dose = _safe_float(scr.ids.dose_mg.text)
+        interval_h = _safe_float(scr.ids.interval_h.text)
+        max_daily = _safe_float(scr.ids.max_daily.text)
+
+        if not name:
+            scr.ids.action_result.text = "Enter a medication name."
+            return
+
+        def job():
+            data = self._vault.load()
+            meds = list(data.get("meds") or [])
+
+            if self._selected_med_id:
+                for m in meds:
+                    if str(m.get("id") or "") == self._selected_med_id:
+                        m["name"] = name
+                        m["dose_mg"] = dose
+                        m["interval_hours"] = interval_h
+                        m["max_daily_mg"] = max_daily
+                        break
+                else:
+                    self._selected_med_id = None
+
+            if not self._selected_med_id:
+                mid = uuid.uuid4().hex[:12]
+                meds.append({
+                    "id": mid,
+                    "name": name,
+                    "dose_mg": dose,
+                    "interval_hours": interval_h,
+                    "max_daily_mg": max_daily,
+                    "last_taken_ts": 0.0,
+                    "history": [],
+                })
+                self._selected_med_id = mid
+
+            data["meds"] = meds
+            self._vault.save(data)
+            return True
+
+        fut = self._exec.submit(job)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._save_done(f), 0))
+
+    def _save_done(self, fut):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        try:
+            fut.result()
+            scr.ids.action_result.text = "Saved."
+        except Exception as e:
+            scr.ids.action_result.text = f"Save failed: {e}"
+        self.refresh_meds()
+
+    def on_delete_med(self):
+        if not self._selected_med_id or not self._vault or not self._exec:
+            return
+        mid = self._selected_med_id
+
+        def job():
+            data = self._vault.load()
+            meds = [m for m in (data.get("meds") or []) if str(m.get("id") or "") != mid]
+            data["meds"] = meds
+            self._vault.save(data)
+            return True
+
+        fut = self._exec.submit(job)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._delete_done(f), 0))
+
+    def _delete_done(self, fut):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        try:
+            fut.result()
+            scr.ids.action_result.text = "Deleted."
+            self._selected_med_id = None
+        except Exception as e:
+            scr.ids.action_result.text = f"Delete failed: {e}"
+        self.refresh_meds()
+
+    def on_log_dose(self):
+        if not self._selected_med_id or not self._vault or not self._exec:
+            return
+        if not self._model_mgr:
+            return
+
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        dose_override = _safe_float(scr.ids.dose_mg.text)  # allow override per log
+
+        self._pill("warn", "Working")
+        scr.ids.action_result.text = "Checking dose…"
+
+        def job():
+            data = self._vault.load()
+            meds = list(data.get("meds") or [])
+            now_ts = _now()
+
+            for m in meds:
+                if str(m.get("id") or "") == self._selected_med_id:
+                    dose_mg = float(dose_override or m.get("dose_mg") or 0.0)
+
+                    # LLM label (strict) with fallback
+                    lvl, raw = run_med_scan_blocking(self._model_mgr, m, dose_mg)
+
+                    # Always log dose after assessment.
+                    # If you want to BLOCK logging when lvl=="High", add:
+                    #   if lvl == "High": return (lvl, raw, False)
+                    hist = list(m.get("history") or [])
+                    hist.append([now_ts, dose_mg])
+                    m["history"] = hist[-300:]
+                    m["last_taken_ts"] = now_ts
+                    if dose_override:
+                        m["dose_mg"] = dose_override
+
+                    data["meds"] = meds
+                    self._vault.save(data)
+                    return (lvl, raw, True)
+
+            return ("Medium", "Selection missing.", False)
+
+        fut = self._exec.submit(job)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._log_done(f), 0))
+
+    def _log_done(self, fut):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        try:
+            lvl, raw, did = fut.result()
+        except Exception as e:
+            lvl, raw, did = ("High", f"Log failed: {e}", False)
+
+        lvl_u = (lvl or "").strip().capitalize()
+        if lvl_u not in ("Low", "Medium", "High"):
+            lvl_u = "Neutral"
+
+        self._set_risk_ui(lvl_u)
+
+        if lvl_u == "Low":
+            self._pill("good", "Low")
+        elif lvl_u == "Medium":
+            self._pill("warn", "Medium")
+        elif lvl_u == "High":
+            self._pill("bad", "High")
+        else:
+            self._pill("neutral", "Neutral")
+
+        # Show a short message
+        scr.ids.action_result.text = raw[:220] if raw else ("Logged." if did else "No change.")
+        self.refresh_meds()
+
+    # ---- Android background service start/stop ----
+    def _service_class(self) -> Optional[Any]:
+        """
+        For buildozer.spec: services = medservice:service/med_service.py:foreground:sticky
+        p4a generates a class: <package>.ServiceMedservice
+        """
+        if _kivy_platform != "android" or autoclass is None:
+            return None
+        try:
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            act = PythonActivity.mActivity
+            pkg = act.getApplicationContext().getPackageName()
+            return autoclass(f"{pkg}.ServiceMedservice")
+        except Exception:
+            return None
+
+    def start_bg_service(self):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        if _kivy_platform != "android":
+            scr.ids.action_result.text = "Background service is Android-only."
+            return
+        svc = self._service_class()
+        if not svc:
+            scr.ids.action_result.text = "Service class not found (check buildozer.spec services=...)."
+            return
+        try:
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            act = PythonActivity.mActivity
+            svc.start(act, "icon", "MedSafe", "Reminders active", "")
+            scr.ids.action_result.text = "Background reminders started."
+        except Exception as e:
+            scr.ids.action_result.text = f"Start failed: {e}"
+
+    def stop_bg_service(self):
+        scr = self.root.ids.screen_manager.get_screen("meds")
+        if _kivy_platform != "android":
+            scr.ids.action_result.text = "Background service is Android-only."
+            return
+        svc = self._service_class()
+        if not svc:
+            scr.ids.action_result.text = "Service class not found."
+            return
+        try:
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            act = PythonActivity.mActivity
+            svc.stop(act)
+            scr.ids.action_result.text = "Background reminders stopped."
+        except Exception as e:
+            scr.ids.action_result.text = f"Stop failed: {e}"
+
 
 if __name__ == "__main__":
-    SecureLLMApp().run()
+    MedSafeApp().run()
+```0

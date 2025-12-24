@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-MedSafe — Multi-med reminder + dosage check (Low/Medium/High) + llama.cpp offline classifier
-+ Android foreground sticky service controls (for background reminders)
-
-Project layout (recommended):
-  main.py
-  service/med_service.py     # background reminder service (separate process)
-  buildozer.spec
-
-IMPORTANT:
-- Set MODEL_URL + MODEL_SHA256 to your GGUF location + hash.
-- This file keeps working even if the model isn't ready: it falls back to heuristic checks.
-"""
-
 import os
 import re
 import json
@@ -1668,4 +1652,3 @@ class MedSafeApp(MDApp):
 
 if __name__ == "__main__":
     MedSafeApp().run()
-```0

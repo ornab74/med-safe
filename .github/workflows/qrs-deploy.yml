@@ -15,10 +15,6 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROIDSDK: /usr/local/lib/android/sdk
 
-      MODEL_URL: https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/llama3-small-Q3_K_M.gguf
-      MODEL_FILENAME: llama3-small-Q3_K_M.gguf
-      MODEL_SHA256_EXPECTED: 8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa
-
       GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8'
       JAVA_TOOL_OPTIONS: -Xmx4096m
 
@@ -72,24 +68,6 @@ jobs:
           pip install "Cython<3.0"
           pip install buildozer cryptography
 
-      - name: Download GGUF model
-        run: |
-          mkdir -p models
-          curl -L --fail -o "models/$MODEL_FILENAME" "$MODEL_URL"
-
-      - name: Verify model SHA256
-        run: |
-          ACTUAL="$(sha256sum "models/$MODEL_FILENAME" | awk '{print $1}')"
-          [ "$ACTUAL" = "$MODEL_SHA256_EXPECTED" ]
-
-      - name: Encrypt model
-        env:
-          BOOTSTRAP_SECRET: ${{ secrets.BOOTSTRAP_SECRET }}
-        run: |
-          mkdir -p tools
-          python tools/prepare_model.py "models/$MODEL_FILENAME" models
-          rm -f "models/$MODEL_FILENAME"
-
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
         run: |
@@ -121,3 +99,4 @@ jobs:
         with:
           name: QRS-Android-APK
           path: bin/*.apk
+```0

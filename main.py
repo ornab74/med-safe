@@ -61,9 +61,9 @@ except Exception:
 # ---------------------------
 # YOU MUST SET THESE
 # ---------------------------
-MODEL_URL = "https://YOUR_HOST/YOUR_MODEL.gguf"  # <- set me
-MODEL_SHA256 = "YOUR_64_HEX_SHA256"              # <- set me
-MODEL_FILENAME = "medsafe_model.gguf"
+MODEL_URL = "https://huggingface.co/tensorblock/llama3-small-GGUF/resolve/main/"  # <- set me
+MODEL_SHA256 = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"              # <- set me
+MODEL_FILENAME = "llama3-small-Q3_K_M.gguf"
 CHUNK = 1024 * 1024
 
 # Thread caps (avoid BLAS thread storms)

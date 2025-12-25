@@ -56,10 +56,8 @@ include_patterns =
 # If you auto-download a model: INTERNET
 # If you run a foreground sticky service for reminders: FOREGROUND_SERVICE
 # Android 13+ notifications: POST_NOTIFICATIONS
-android.permissions =
-    INTERNET,
-    FOREGROUND_SERVICE,
-    POST_NOTIFICATIONS
+android.permissions = INTERNET, POST_NOTIFICATIONS, FOREGROUND_SERVICE
+
 
 # If you implement exact alarms (optional): SCHEDULE_EXACT_ALARM
 # android.permissions = INTERNET,FOREGROUND_SERVICE,POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM

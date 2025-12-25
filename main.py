@@ -1,13 +1,11 @@
-
 import os
-import re
 import json
 import time
 import uuid
 import threading
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -19,7 +17,7 @@ from kivy.clock import Clock
 from kivy.utils import platform as _kivy_platform
 
 from kivymd.app import MDApp
-from kivymd.uix.appbar import MDTopAppBar  # <-- hard switch, no fallback
+from kivymd.uix.appbar import MDTopAppBar  # NEW KIVYMD
 from kivymd.uix.list import OneLineListItem
 
 # Optional Android files dir (Context.getFilesDir)
@@ -29,9 +27,8 @@ except Exception:
     autoclass = None
 
 logger = logging.getLogger("medsafe")
-logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
-CHUNK = 1024 * 1024
 
 KV = r"""
 MDScreen:
@@ -43,8 +40,10 @@ MDScreen:
             title: "MedSafe (Prototype)"
             elevation: 6
             right_action_items:
-                [["bug-outline", lambda x: app.show_debug()],
-                 ["refresh", lambda x: app.refresh_meds()]]
+                [
+                ["bug-outline", lambda x: app.show_debug()],
+                ["refresh", lambda x: app.refresh_meds()]
+                ]
 
         MDBoxLayout:
             orientation: "vertical"
@@ -63,7 +62,8 @@ MDScreen:
                 id: risk
                 text: "Risk: —"
                 halign: "center"
-                font_style: "H6"
+                theme_text_color: "Primary"
+                font_size: "20sp"
                 size_hint_y: None
                 height: "34dp"
 
@@ -84,24 +84,20 @@ MDScreen:
                 MDTextField:
                     id: med_name
                     hint_text: "Medication name"
-                    mode: "fill"
 
                 MDTextField:
                     id: dose_mg
                     hint_text: "Dose (mg) e.g. 200"
-                    mode: "fill"
                     input_filter: "float"
 
                 MDTextField:
                     id: interval_h
                     hint_text: "Interval hours e.g. 8"
-                    mode: "fill"
                     input_filter: "float"
 
                 MDTextField:
                     id: max_daily
                     hint_text: "Max daily mg (optional) e.g. 1200"
-                    mode: "fill"
                     input_filter: "float"
 
                 MDBoxLayout:
@@ -136,7 +132,8 @@ MDScreen:
 
             MDLabel:
                 text: "Medications"
-                bold: True
+                halign: "left"
+                theme_text_color: "Primary"
                 size_hint_y: None
                 height: "24dp"
 
@@ -149,7 +146,7 @@ MDScreen:
 
 
 # ---------------------------
-# Crypto (AES-GCM, streaming not needed for small JSON)
+# Crypto (AES-GCM)
 # ---------------------------
 def hkdf32(secret: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
@@ -210,7 +207,6 @@ class Vault:
             k = self.key_path.read_bytes()
             if len(k) >= 32:
                 return k[:32]
-        # create
         k = os.urandom(32)
         _atomic_write(self.key_path, k)
         return k
@@ -223,13 +219,15 @@ class Vault:
             try:
                 blob = self.data_path.read_bytes()
                 pt = decrypt_bytes_gcm(blob, key)
-                obj = json.loads(pt.decode("utf-8", errors="ignore") or "{}")
+                # STRICT utf-8 decode; if corrupted, fail cleanly (don’t mojibake/ignore)
+                obj = json.loads(pt.decode("utf-8") or "{}")
                 if not isinstance(obj, dict):
                     return {"version": 1, "meds": []}
                 obj.setdefault("version", 1)
                 obj.setdefault("meds", [])
                 return obj
-            except Exception:
+            except Exception as e:
+                logger.exception("Vault load failed: %s", e)
                 return {"version": 1, "meds": []}
 
     def save(self, obj: Dict[str, Any]):
@@ -248,12 +246,6 @@ def _safe_float(s: str) -> float:
 
 
 def dose_safety_level(med: Dict[str, Any], dose_mg: float, now_ts: float) -> Tuple[str, str]:
-    """
-    Conservative heuristic.
-    - High: too soon ( <60% of interval ) OR projected > 105% of daily max
-    - Medium: close to interval ( <85% ) OR projected > 90% of daily max
-    - Low: otherwise
-    """
     interval_h = float(med.get("interval_hours") or 0.0)
     max_daily = float(med.get("max_daily_mg") or 0.0)
     history = list(med.get("history") or [])
@@ -307,8 +299,23 @@ class MedSafeApp(MDApp):
 
         self._vault = Vault(self._files_dir)
 
-        root = Builder.load_string(KV)
-        Clock.schedule_once(lambda dt: self.refresh_meds(), 0.1)
+        # Android runtime permission for notifications (Android 13+).
+        # INTERNET is NOT runtime—must be in buildozer.spec.
+        if _kivy_platform == "android":
+            try:
+                from android.permissions import request_permissions, Permission  # type: ignore
+                request_permissions([Permission.POST_NOTIFICATIONS])
+            except Exception:
+                pass
+
+        try:
+            root = Builder.load_string(KV)
+        except Exception as e:
+            # If KV fails, you want to SEE it instead of silent crash.
+            logger.exception("KV load failed: %s", e)
+            raise
+
+        Clock.schedule_once(lambda _dt: self.refresh_meds(), 0.1)
         return root
 
     def on_stop(self):
@@ -349,15 +356,20 @@ class MedSafeApp(MDApp):
             return
         self._set_status("Loading…")
         fut = self._exec.submit(self._vault.load)
-        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._refresh_ui(f), 0))
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda _dt: self._refresh_ui_from_future(f), 0))
 
-    def _refresh_ui(self, fut):
+    def _refresh_ui_from_future(self, fut):
         try:
             data = fut.result()
-        except Exception:
+        except Exception as e:
+            logger.exception("Load failed: %s", e)
             data = {"version": 1, "meds": []}
 
+        self._refresh_ui(data)
+
+    def _refresh_ui(self, data: Dict[str, Any]):
         meds = list(data.get("meds") or [])
+
         try:
             lst = self.root.ids.med_list
             lst.clear_widgets()
@@ -378,6 +390,7 @@ class MedSafeApp(MDApp):
             self._render_selected(data)
             self._set_status("Ready")
         except Exception as e:
+            logger.exception("UI refresh failed: %s", e)
             self._set_status(f"UI refresh failed: {e}")
 
     def _render_selected(self, data: Dict[str, Any]):
@@ -417,24 +430,27 @@ class MedSafeApp(MDApp):
             self._set_status("Enter a medication name.")
             return
 
+        current_selected = self._selected_med_id
         self._set_status("Saving…")
 
-        def job():
+        def job(selected_id: Optional[str]):
             data = self._vault.load()
             meds = list(data.get("meds") or [])
 
-            if self._selected_med_id:
+            new_selected = selected_id
+
+            if new_selected:
                 for m in meds:
-                    if str(m.get("id") or "") == self._selected_med_id:
+                    if str(m.get("id") or "") == new_selected:
                         m["name"] = name
                         m["dose_mg"] = dose
                         m["interval_hours"] = interval_h
                         m["max_daily_mg"] = max_daily
                         break
                 else:
-                    self._selected_med_id = None
+                    new_selected = None
 
-            if not self._selected_med_id:
+            if not new_selected:
                 mid = uuid.uuid4().hex[:12]
                 meds.append({
                     "id": mid,
@@ -445,20 +461,22 @@ class MedSafeApp(MDApp):
                     "last_taken_ts": 0.0,
                     "history": [],
                 })
-                self._selected_med_id = mid
+                new_selected = mid
 
             data["meds"] = meds
             self._vault.save(data)
-            return True
+            return new_selected
 
-        fut = self._exec.submit(job)
-        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._save_done(f), 0))
+        fut = self._exec.submit(job, current_selected)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda _dt: self._save_done(f), 0))
 
     def _save_done(self, fut):
         try:
-            fut.result()
+            new_selected = fut.result()
+            self._selected_med_id = new_selected
             self._set_status("Saved.")
         except Exception as e:
+            logger.exception("Save failed: %s", e)
             self._set_status(f"Save failed: {e}")
         self.refresh_meds()
 
@@ -470,15 +488,15 @@ class MedSafeApp(MDApp):
         mid = self._selected_med_id
         self._set_status("Deleting…")
 
-        def job():
+        def job(del_id: str):
             data = self._vault.load()
-            meds = [m for m in (data.get("meds") or []) if str(m.get("id") or "") != mid]
+            meds = [m for m in (data.get("meds") or []) if str(m.get("id") or "") != del_id]
             data["meds"] = meds
             self._vault.save(data)
             return True
 
-        fut = self._exec.submit(job)
-        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._delete_done(f), 0))
+        fut = self._exec.submit(job, mid)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda _dt: self._delete_done(f), 0))
 
     def _delete_done(self, fut):
         try:
@@ -486,6 +504,7 @@ class MedSafeApp(MDApp):
             self._selected_med_id = None
             self._set_status("Deleted.")
         except Exception as e:
+            logger.exception("Delete failed: %s", e)
             self._set_status(f"Delete failed: {e}")
         self.refresh_meds()
 
@@ -494,26 +513,26 @@ class MedSafeApp(MDApp):
             self._set_status("Select a medication first.")
             return
 
+        sel_id = self._selected_med_id
         dose_override = _safe_float(self.root.ids.dose_mg.text)
         self._set_status("Checking…")
 
-        def job():
+        def job(selected_id: str, override: float):
             data = self._vault.load()
             meds = list(data.get("meds") or [])
             now_ts = time.time()
 
             for m in meds:
-                if str(m.get("id") or "") == self._selected_med_id:
-                    dose_mg = float(dose_override or m.get("dose_mg") or 0.0)
+                if str(m.get("id") or "") == selected_id:
+                    dose_mg = float(override or m.get("dose_mg") or 0.0)
                     lvl, msg = dose_safety_level(m, dose_mg, now_ts)
 
-                    # Log dose regardless (prototype behavior)
                     hist = list(m.get("history") or [])
                     hist.append([now_ts, dose_mg])
                     m["history"] = hist[-300:]
                     m["last_taken_ts"] = now_ts
-                    if dose_override:
-                        m["dose_mg"] = dose_override
+                    if override:
+                        m["dose_mg"] = override
 
                     data["meds"] = meds
                     self._vault.save(data)
@@ -521,13 +540,14 @@ class MedSafeApp(MDApp):
 
             return ("Medium", "Selection missing.")
 
-        fut = self._exec.submit(job)
-        fut.add_done_callback(lambda f: Clock.schedule_once(lambda dt: self._log_done(f), 0))
+        fut = self._exec.submit(job, sel_id, dose_override)
+        fut.add_done_callback(lambda f: Clock.schedule_once(lambda _dt: self._log_done(f), 0))
 
     def _log_done(self, fut):
         try:
             lvl, msg = fut.result()
         except Exception as e:
+            logger.exception("Log failed: %s", e)
             lvl, msg = ("High", f"Log failed: {e}")
 
         self._set_risk(lvl, msg)
@@ -536,3 +556,4 @@ class MedSafeApp(MDApp):
 
 if __name__ == "__main__":
     MedSafeApp().run()
+

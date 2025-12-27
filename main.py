@@ -55,8 +55,8 @@ except Exception:
 # -------------------------
 # Package identity (for Java)
 # -------------------------
-PACKAGE_DOMAIN = "org.example"
-PACKAGE_NAME = "medreminder"
+PACKAGE_DOMAIN = "com.medsafe"
+PACKAGE_NAME = "medsafellm"
 JAVA_PACKAGE = f"{PACKAGE_DOMAIN}.{PACKAGE_NAME}"  # org.example.medreminder
 JAVA_ALARM_RECEIVER = f"{JAVA_PACKAGE}.AlarmReceiver"
 JAVA_BOOT_RECEIVER = f"{JAVA_PACKAGE}.BootReceiver"

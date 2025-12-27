@@ -47,7 +47,7 @@ include_patterns =
 # - RECEIVE_BOOT_COMPLETED to resync after reboot
 # - WAKE_LOCK/VIBRATE optional, improves reliability/UX
 # - FOREGROUND_SERVICE only needed if you truly run a foreground service
-android.permissions = INTERNET,POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM,RECEIVE_BOOT_COMPLETED,WAKE_LOCK,VIBRATE,FOREGROUND_SERVICE
+#android.permissions = INTERNET,POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM,RECEIVE_BOOT_COMPLETED,WAKE_LOCK,VIBRATE,FOREGROUND_SERVICE
 
 # ----------------------------
 # Android Java sources + manifest injection (NO extra_manifest.xml file required)
@@ -55,7 +55,7 @@ android.permissions = INTERNET,POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM,RECEIVE_B
 # You must have these files committed in your repo:
 #   android_src/com/medsafe/medsafellm/AlarmReceiver.java
 #   android_src/com/medsafe/medsafellm/BootReceiver.java
-android.add_src = android_src
+#android.add_src = android_src
 
 # IMPORTANT:
 # Must be a SINGLE LINE, otherwise buildozer may misinterpret it as a filename and try to open() it.

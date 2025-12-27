@@ -63,7 +63,7 @@ android.extra_manifest_application_arguments = '<receiver android:name="com.meds
 # Android services (optional)
 # ----------------------------
 # If you switch to AlarmManager-only reminders, remove this line AND remove FOREGROUND_SERVICE permission.
-services = medservice:service/med_service.py:foreground:sticky
+#services = medservice:service/med_service.py:foreground:sticky
 
 # ----------------------------
 # SDK / NDK

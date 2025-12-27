@@ -1,21 +1,17 @@
+
 # main.py
-# Medicine Reminder (KivyMD) — Advanced UI + Encrypted DB + Android AlarmManager (persistent)
+# MedSafe (KivyMD) — Advanced UI + Encrypted DB + Android Foreground Service reminders (NO JAVA)
 #
-# Single-file project:
-# - Run normally:            python main.py
-# - Generate Android Java + manifest injection files for Buildozer:
-#                            python main.py --gen-android
+# Single-file UI + encrypted DB.
+# Background reminders are handled by a python-for-android SERVICE (service/med_service.py).
 #
-# Buildozer notes (in buildozer.spec):
-#   requirements = python3,kivy,kivymd,pyjnius,cryptography
-#   android.api = 34
-#   android.minapi = 24
-#   android.permissions = POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM,RECEIVE_BOOT_COMPLETED,WAKE_LOCK,VIBRATE
-#   android.add_src = android_src
-#   android.extra_manifest_xml = android_src/extra_manifest.xml
+# Buildozer notes (buildozer.spec):
+#   - requirements include: python3,kivy,kivymd,pyjnius,cryptography,...
+#   - android.permissions include: POST_NOTIFICATIONS,FOREGROUND_SERVICE,WAKE_LOCK,VIBRATE
+#   - services = medservice:service/med_service.py:foreground:sticky
 #
 # IMPORTANT:
-# - Set PACKAGE_DOMAIN / PACKAGE_NAME to match your buildozer.spec (package.domain / package.name).
+# - Remove any android_src / extra_manifest_xml / Java receiver config from buildozer.spec.
 
 import os, sys, time, json, uuid, logging, sqlite3, threading, hashlib
 from pathlib import Path
@@ -34,13 +30,13 @@ from kivy.uix.widget import Widget
 from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle, Ellipse
-from kivy.properties import NumericProperty, ListProperty, StringProperty
+from kivy.properties import NumericProperty, ListProperty
 from kivy.utils import platform as _kivy_platform
 
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
 from kivymd.uix.button import MDFlatButton, MDRaisedButton, MDIconButton
-from kivymd.uix.list import TwoLineIconListItem, OneLineIconListItem, IconLeftWidget, MDList
+from kivymd.uix.list import TwoLineIconListItem, IconLeftWidget, MDList
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
 from kivymd.uix.label import MDLabel
@@ -52,14 +48,6 @@ except Exception:
     autoclass = None
     cast = None
 
-# -------------------------
-# Package identity (for Java)
-# -------------------------
-PACKAGE_DOMAIN = "com.medsafe"
-PACKAGE_NAME = "medsafellm"
-JAVA_PACKAGE = f"{PACKAGE_DOMAIN}.{PACKAGE_NAME}"  # org.example.medreminder
-JAVA_ALARM_RECEIVER = f"{JAVA_PACKAGE}.AlarmReceiver"
-JAVA_BOOT_RECEIVER = f"{JAVA_PACKAGE}.BootReceiver"
 
 if _kivy_platform != "android" and hasattr(Window, "size"):
     Window.size = (420, 760)
@@ -68,7 +56,6 @@ if _kivy_platform != "android" and hasattr(Window, "size"):
 # Paths / Locks
 # -------------------------
 _CRYPTO_LOCK = RLock()
-_SCHEDULE_LOCK = RLock()
 _LOG_LOCK = RLock()
 
 def _is_writable_dir(p: Path) -> bool:
@@ -301,7 +288,7 @@ class MedicineDB:
                         name TEXT NOT NULL,
                         dosage TEXT,
                         frequency TEXT,
-                        times TEXT,          -- JSON list of "HH:MM"
+                        times TEXT,
                         start_date TEXT,
                         end_date TEXT,
                         notes TEXT,
@@ -416,9 +403,8 @@ class MedicineDB:
 
         upcoming = []
         for med in meds:
-            times = []
             try:
-                times = json.loads(med["times"] or "[]")
+                times = json.loads(med.get("times") or "[]")
             except Exception:
                 times = []
             for t in times:
@@ -442,28 +428,15 @@ class MedicineDB:
         return upcoming
 
 # -------------------------
-# Android runtime permissions & AlarmManager scheduling
+# Android runtime permission helpers
 # -------------------------
-def android_sdk_int() -> int:
+def ensure_android_notification_permission():
     if not _android_ready():
-        return 0
+        return
     try:
         BuildVERSION = autoclass("android.os.Build$VERSION")
-        return int(BuildVERSION.SDK_INT)
-    except Exception:
-        return 0
-
-def ensure_android_notification_permission():
-    """
-    Android 13+ needs POST_NOTIFICATIONS runtime permission.
-    If request fails (OEM quirks), we log and continue; app still works.
-    """
-    if not _android_ready():
-        return
-    sdk = android_sdk_int()
-    if sdk < 33:
-        return
-    try:
+        if int(BuildVERSION.SDK_INT) < 33:
+            return
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         activity = PythonActivity.mActivity
         ContextCompat = autoclass("androidx.core.content.ContextCompat")
@@ -479,85 +452,27 @@ def ensure_android_notification_permission():
     except Exception:
         logger.exception("POST_NOTIFICATIONS request failed")
 
-def can_schedule_exact_alarms() -> bool:
+# -------------------------
+# Start foreground sticky python service (NO JAVA)
+# -------------------------
+def start_background_service():
     """
-    Android 12+ has canScheduleExactAlarms().
-    We’ll still schedule with a fallback if false.
+    Starts python-for-android service declared in buildozer.spec:
+      services = medservice:service/med_service.py:foreground:sticky
     """
     if not _android_ready():
-        return False
-    sdk = android_sdk_int()
-    if sdk < 31:
-        return True
+        return
     try:
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         activity = PythonActivity.mActivity
-        Context = autoclass("android.content.Context")
-        AlarmManager = autoclass("android.app.AlarmManager")
-        am = cast(AlarmManager, activity.getSystemService(Context.ALARM_SERVICE))
-        return bool(am.canScheduleExactAlarms())
+        PythonService = autoclass("org.kivy.android.PythonService")
+        PythonService.start(activity, "")
+        logger.info("medservice started")
     except Exception:
-        logger.exception("canScheduleExactAlarms check failed")
-        return False
-
-class AndroidAlarm:
-    @staticmethod
-    def schedule(at_time: datetime, title: str, body: str, request_code: int):
-        """
-        Schedules an AlarmManager broadcast to AlarmReceiver.java (persistent).
-        """
-        if not _android_ready():
-            logger.info(f"[Simulated alarm] {title} - {body} @ {at_time}")
-            return
-
-        try:
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            activity = PythonActivity.mActivity
-            app_ctx = activity.getApplicationContext()
-
-            Intent = autoclass("android.content.Intent")
-            PendingIntent = autoclass("android.app.PendingIntent")
-            AlarmManager = autoclass("android.app.AlarmManager")
-            Context = autoclass("android.content.Context")
-            Build = autoclass("android.os.Build")
-
-            intent = Intent()
-            intent.setClassName(app_ctx, JAVA_ALARM_RECEIVER)
-            intent.putExtra("title", title)
-            intent.putExtra("body", body)
-
-            flags = PendingIntent.FLAG_UPDATE_CURRENT
-            if int(Build.VERSION.SDK_INT) >= 23:
-                flags |= PendingIntent.FLAG_IMMUTABLE
-
-            pi = PendingIntent.getBroadcast(app_ctx, int(request_code), intent, int(flags))
-            am = cast(AlarmManager, app_ctx.getSystemService(Context.ALARM_SERVICE))
-
-            trigger_ms = int(at_time.timestamp() * 1000)
-
-            # Doze-friendly scheduling:
-            if int(Build.VERSION.SDK_INT) >= 23:
-                if can_schedule_exact_alarms():
-                    am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger_ms, pi)
-                    logger.info(f"alarm exact+idle rc={request_code} @ {at_time}")
-                else:
-                    # Fallback (not guaranteed exact on some devices/versions):
-                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger_ms, pi)
-                    logger.info(f"alarm idle(fallback) rc={request_code} @ {at_time}")
-            else:
-                am.setExact(AlarmManager.RTC_WAKEUP, trigger_ms, pi)
-                logger.info(f"alarm exact rc={request_code} @ {at_time}")
-        except Exception:
-            logger.exception("alarm scheduling failed")
-
-def stable_alarm_request_code(med_id: int, when_dt: datetime) -> int:
-    # Stable per med + date + time (to reduce duplicates)
-    key = f"{med_id}|{when_dt.strftime('%Y-%m-%d %H:%M')}"
-    h = hashlib.sha256(key.encode("utf-8")).digest()
-    return int.from_bytes(h[:4], "big") & 0x7FFFFFFF
+        logger.exception("failed to start medservice")
 
 # -------------------------
-# (Optional) in-app scheduler thread (desktop / fallback)
+# Desktop-only / in-app lightweight scheduler (optional)
 # -------------------------
 class BackgroundScheduler:
     def __init__(self, db: MedicineDB):
@@ -571,7 +486,7 @@ class BackgroundScheduler:
         self.running = True
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
-        logger.info("background scheduler started")
+        logger.info("in-app scheduler started")
 
     def stop(self):
         self.running = False
@@ -583,12 +498,10 @@ class BackgroundScheduler:
             try:
                 self._check()
             except Exception:
-                logger.exception("background scheduler check failed")
+                logger.exception("in-app scheduler check failed")
             time.sleep(30)
 
     def _check(self):
-        # Lightweight: if app running, schedule Android alarms periodically
-        # (Android side) OR simulate notifications on desktop
         upcoming = self.db.get_upcoming_doses(hours=2)
         now = datetime.now()
         for u in upcoming:
@@ -734,7 +647,7 @@ MDScreen:
 
                                 MDLabel:
                                     id: alarm_status
-                                    text: "Alarms: —"
+                                    text: "Background: —"
                                     theme_text_color: "Secondary"
 
                     MDLabel:
@@ -757,8 +670,8 @@ MDScreen:
                             on_release: app.show_add_dialog()
 
                         MDRaisedButton:
-                            text: "Resync Alarms"
-                            on_release: app.resync_alarms()
+                            text: "Start Service"
+                            on_release: app.start_service_from_ui()
 
             MDScreen:
                 name: "medicines"
@@ -907,125 +820,6 @@ MDScreen:
 """
 
 # -------------------------
-# Android source generator (Buildozer)
-# -------------------------
-JAVA_ALARM_RECEIVER_SRC = r"""
-package {JAVA_PACKAGE};
-
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-import android.os.Build;
-
-public class AlarmReceiver extends BroadcastReceiver {{
-    private static final String CHANNEL_ID = "medicine_reminders";
-
-    @Override
-    public void onReceive(Context context, Intent intent) {{
-        String title = intent.getStringExtra("title");
-        String body = intent.getStringExtra("body");
-        if (title == null) title = "Medicine Reminder";
-        if (body == null) body = "Time to take your medicine";
-
-        NotificationManager nm =
-                (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-
-        if (Build.VERSION.SDK_INT >= 26) {{
-            NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Medicine Reminders",
-                    NotificationManager.IMPORTANCE_HIGH
-            );
-            ch.setDescription("Scheduled medicine reminders");
-            nm.createNotificationChannel(ch);
-        }}
-
-        Notification.Builder b = (Build.VERSION.SDK_INT >= 26)
-                ? new Notification.Builder(context, CHANNEL_ID)
-                : new Notification.Builder(context);
-
-        b.setContentTitle(title)
-         .setContentText(body)
-         .setSmallIcon(context.getApplicationInfo().icon)
-         .setAutoCancel(true);
-
-        int nid = (int)(System.currentTimeMillis() & 0x7fffffff);
-        nm.notify(nid, b.build());
-    }}
-}}
-"""
-
-JAVA_BOOT_RECEIVER_SRC = r"""
-package {JAVA_PACKAGE};
-
-import android.content.BroadcastReceiver;
-import android.content.Context;
-import android.content.Intent;
-
-public class BootReceiver extends BroadcastReceiver {{
-    @Override
-    public void onReceive(Context context, Intent intent) {{
-        // Launch app so Python can resync alarms from encrypted DB.
-        Intent launch = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
-        if (launch != null) {{
-            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            context.startActivity(launch);
-        }}
-    }}
-}}
-"""
-
-EXTRA_MANIFEST_XML = r"""<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-    <uses-permission android:name="android.permission.WAKE_LOCK"/>
-    <uses-permission android:name="android.permission.VIBRATE"/>
-
-    <application>
-        <receiver
-            android:name="{JAVA_PACKAGE}.AlarmReceiver"
-            android:exported="false" />
-
-        <receiver
-            android:name="{JAVA_PACKAGE}.BootReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED"/>
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
-            </intent-filter>
-        </receiver>
-    </application>
-</manifest>
-"""
-
-def write_android_sources(out_dir: Path):
-    pkg_path = Path(*JAVA_PACKAGE.split("."))
-    src_root = out_dir / "android_src"
-    java_dir = src_root / pkg_path
-    java_dir.mkdir(parents=True, exist_ok=True)
-
-    (java_dir / "AlarmReceiver.java").write_text(
-        JAVA_ALARM_RECEIVER_SRC.format(JAVA_PACKAGE=JAVA_PACKAGE),
-        encoding="utf-8"
-    )
-    (java_dir / "BootReceiver.java").write_text(
-        JAVA_BOOT_RECEIVER_SRC.format(JAVA_PACKAGE=JAVA_PACKAGE),
-        encoding="utf-8"
-    )
-    (src_root / "extra_manifest.xml").write_text(
-        EXTRA_MANIFEST_XML.format(JAVA_PACKAGE=JAVA_PACKAGE),
-        encoding="utf-8"
-    )
-    print(f"[gen] Wrote android sources to: {src_root}")
-    print("[gen] In buildozer.spec set:")
-    print("      android.add_src = android_src")
-    print("      android.extra_manifest_xml = android_src/extra_manifest.xml")
-
-# -------------------------
 # App
 # -------------------------
 class MedicineReminderApp(MDApp):
@@ -1035,8 +829,6 @@ class MedicineReminderApp(MDApp):
         self.scheduler: Optional[BackgroundScheduler] = None
         self._add_dialog: Optional[MDDialog] = None
         self._edit_dialog: Optional[MDDialog] = None
-
-        # temp dialog fields
         self._time_list: List[str] = []
 
     def build(self):
@@ -1053,22 +845,18 @@ class MedicineReminderApp(MDApp):
         key = get_or_create_key()
         self.db = MedicineDB(key)
 
-        # In-app scheduler is mainly for desktop; on Android we still run it lightly.
+        # Start service on Android (NO JAVA)
+        start_background_service()
+
+        # Desktop-friendly scheduler (optional)
         self.scheduler = BackgroundScheduler(self.db)
         self.scheduler.start()
 
         self.root.ids.screen_manager.current = "home"
         Clock.schedule_once(lambda *_: self.refresh_all(), 0.4)
 
-        # Periodic UI refresh
         Clock.schedule_interval(lambda *_: self.refresh_upcoming(), 60)
         Clock.schedule_interval(lambda *_: self.refresh_log(silent=True), 20)
-
-        # Periodic alarm resync (Android): keep next 36h scheduled
-        Clock.schedule_interval(lambda *_: self.resync_alarms(silent=True), 60 * 15)
-
-        # initial alarm sync
-        Clock.schedule_once(lambda *_: self.resync_alarms(silent=True), 1.0)
 
     def on_stop(self):
         try:
@@ -1076,6 +864,10 @@ class MedicineReminderApp(MDApp):
                 self.scheduler.stop()
         except Exception:
             pass
+
+    def start_service_from_ui(self):
+        start_background_service()
+        self.root.ids.alarm_status.text = "Background: running"
 
     # -------------------------
     # Navigation
@@ -1114,18 +906,15 @@ class MedicineReminderApp(MDApp):
 
                 item = TwoLineIconListItem(text=text, secondary_text=sub)
                 item.add_widget(IconLeftWidget(icon="clock-outline"))
-
-                # tap to log taken/skip
                 item.on_release = lambda u=u: self.show_log_dose_dialog(u)
                 ul.add_widget(item)
 
             self.root.ids.today_count.text = f"{len(upcoming)} doses scheduled"
 
             if _android_ready():
-                exact = can_schedule_exact_alarms()
-                self.root.ids.alarm_status.text = f"Alarms: {'Exact' if exact else 'Fallback'}"
+                self.root.ids.alarm_status.text = "Background: service"
             else:
-                self.root.ids.alarm_status.text = "Alarms: Desktop (simulated)"
+                self.root.ids.alarm_status.text = "Background: desktop"
         except Exception:
             logger.exception("refresh_upcoming failed")
 
@@ -1138,7 +927,6 @@ class MedicineReminderApp(MDApp):
             ml.clear_widgets()
 
             for m in meds:
-                times = ""
                 try:
                     times = ", ".join(json.loads(m.get("times") or "[]"))
                 except Exception:
@@ -1202,31 +990,6 @@ class MedicineReminderApp(MDApp):
             pass
         self.root.ids.debug_log.text = ""
         logger.info("log cleared")
-
-    # -------------------------
-    # Alarm resync (Android persistent alarms)
-    # -------------------------
-    def resync_alarms(self, silent: bool = False):
-        if not self.db:
-            return
-        with _SCHEDULE_LOCK:
-            try:
-                upcoming = self.db.get_upcoming_doses(hours=36)
-                if _android_ready():
-                    # Schedule each upcoming dose as an alarm
-                    for u in upcoming:
-                        dt = u["time_obj"]
-                        rc = stable_alarm_request_code(u["medicine_id"], dt)
-                        title = "Medicine Reminder"
-                        body = f"{u['name']} • {u.get('dosage','')}".strip()
-                        AndroidAlarm.schedule(dt, title, body, rc)
-                    if not silent:
-                        logger.info(f"resynced alarms for {len(upcoming)} doses")
-                else:
-                    if not silent:
-                        logger.info("resync alarms: desktop (no-op)")
-            except Exception:
-                logger.exception("resync_alarms failed")
 
     # -------------------------
     # Dose logging dialog
@@ -1305,11 +1068,8 @@ class MedicineReminderApp(MDApp):
             picker.open()
 
         def remove_time(t: str):
-            try:
-                self._time_list = [x for x in self._time_list if x != t]
-                redraw_times()
-            except Exception:
-                pass
+            self._time_list[:] = [x for x in self._time_list if x != t]
+            redraw_times()
 
         add_time_btn = MDRaisedButton(text="Add time", on_release=add_time_from_picker)
 
@@ -1323,10 +1083,7 @@ class MedicineReminderApp(MDApp):
                 if not name.text.strip():
                     name.error = True
                     return
-                times = list(self._time_list)
-                if not times:
-                    # sensible default
-                    times = ["09:00"]
+                times = list(self._time_list) or ["09:00"]
                 med_id = self.db.add_medicine(
                     name=name.text.strip(),
                     dosage=dosage.text.strip(),
@@ -1339,7 +1096,6 @@ class MedicineReminderApp(MDApp):
                 logger.info(f"added medicine id={med_id} {name.text.strip()} times={times}")
                 self._add_dialog.dismiss()
                 self.refresh_all()
-                self.resync_alarms(silent=True)
             except Exception:
                 logger.exception("add medicine failed")
 
@@ -1406,7 +1162,7 @@ class MedicineReminderApp(MDApp):
             picker.open()
 
         def remove_time(t: str):
-            self._time_list = [x for x in self._time_list if x != t]
+            self._time_list[:] = [x for x in self._time_list if x != t]
             redraw_times()
 
         add_time_btn = MDRaisedButton(text="Add time", on_release=add_time_from_picker)
@@ -1432,7 +1188,6 @@ class MedicineReminderApp(MDApp):
                 logger.info(f"updated medicine id={med_id} times={times}")
                 self._edit_dialog.dismiss()
                 self.refresh_all()
-                self.resync_alarms(silent=True)
             except Exception:
                 logger.exception("update medicine failed")
 
@@ -1442,7 +1197,6 @@ class MedicineReminderApp(MDApp):
                 logger.info(f"deleted medicine id={med_id}")
                 self._edit_dialog.dismiss()
                 self.refresh_all()
-                self.resync_alarms(silent=True)
             except Exception:
                 logger.exception("delete medicine failed")
 
@@ -1458,14 +1212,7 @@ class MedicineReminderApp(MDApp):
         )
         self._edit_dialog.open()
 
-# -------------------------
-# Entrypoint
-# -------------------------
 def main():
-    if "--gen-android" in sys.argv:
-        write_android_sources(Path.cwd())
-        return
-
     MedicineReminderApp().run()
 
 if __name__ == "__main__":

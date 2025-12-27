@@ -1,7 +1,6 @@
-
 [app]
 # ----------------------------
-# MedSafe — Buildozer config
+# MedSafe — Buildozer config (updated for AlarmManager + version bump)
 # ----------------------------
 
 title = MedSafe
@@ -14,16 +13,13 @@ source.dir = .
 source.main = main.py
 
 # Human version + monotonically increasing version_code
-version = 0.1.21
-android.version_code = 203746223
+version = 0.1.22
+android.version_code = 203746224
 
 # ----------------------------
 # Python / deps
 # ----------------------------
-# Notes:
-# - p4a typically expects pip name "llama-cpp-python" (not llama_cpp_python).
-# - If you use a custom recipe for llama, keep p4a.local_recipes and still list the pip name.
-# - httpx is optional if you're using urllib for download; keep if you prefer httpx.
+# NOTE:
 
 
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
@@ -39,35 +35,46 @@ fullscreen = 0
 # ----------------------------
 # Assets / includes
 # ----------------------------
-# MedSafe downloads model on first run, encrypts it locally.
-# So you generally do NOT ship any model files.
+# Include android_src if you're adding Java receivers + manifest injection.
 include_patterns =
     *.py,
     *.kv,
     assets/*,
-    *.json
-
-# If you ship a default DB/schema, add:
-# include_patterns = ..., *.db
+    *.json,
+    android_src/*
 
 # ----------------------------
 # Android permissions
 # ----------------------------
-# If you auto-download a model: INTERNET
-# If you run a foreground sticky service for reminders: FOREGROUND_SERVICE
-# Android 13+ notifications: POST_NOTIFICATIONS
-android.permissions = INTERNET, POST_NOTIFICATIONS, FOREGROUND_SERVICE
+# Existing:
+# - INTERNET for downloads
+# - FOREGROUND_SERVICE if you actually run a foreground sticky service
+# - POST_NOTIFICATIONS for Android 13+
+#
+# AlarmManager persistence:
+# - SCHEDULE_EXACT_ALARM for exact alarms
+# - RECEIVE_BOOT_COMPLETED to resync after reboot
+# - WAKE_LOCK/VIBRATE nice-to-have for reliable UX
+#
+# (Android 15 is API 35) 1
+android.permissions = INTERNET, POST_NOTIFICATIONS, FOREGROUND_SERVICE, SCHEDULE_EXACT_ALARM, RECEIVE_BOOT_COMPLETED, WAKE_LOCK, VIBRATE
 
-
-# If you implement exact alarms (optional): SCHEDULE_EXACT_ALARM
-# android.permissions = INTERNET,FOREGROUND_SERVICE,POST_NOTIFICATIONS,SCHEDULE_EXACT_ALARM
+# ----------------------------
+# Android Java sources + manifest injection (for AlarmReceiver/BootReceiver)
+# ----------------------------
+# Your main.py --gen-android should create:
+#   android_src/<com>/<medsafe>/<...>.java
+#   android_src/extra_manifest.xml
+#
+# Buildozer supports adding src + extra manifest injection. 
+android.add_src = android_src
+android.extra_manifest_xml = android_src/extra_manifest.xml
 
 # ----------------------------
 # Android services (background reminders)
 # ----------------------------
-# If you add a background service file:
-#   service/med_service.py
-# Use foreground:sticky so the OS keeps it more reliably.
+# If you SWITCH to AlarmManager-only reminders, you can remove the service line
+# and drop FOREGROUND_SERVICE permission.
 services = medservice:service/med_service.py:foreground:sticky
 
 # ----------------------------
@@ -75,6 +82,9 @@ services = medservice:service/med_service.py:foreground:sticky
 # ----------------------------
 android.sdk_path = /usr/local/lib/android/sdk
 
+# API 35 == Android 15 3
+# NOTE: Some people hit build issues when pushing very new APIs/toolchains; if you hit that,
+# drop android.api to 34 while keeping minapi. 4
 android.api = 35
 android.minapi = 23
 android.ndk_api = 23
@@ -86,8 +96,6 @@ android.archs = arm64-v8a
 
 p4a.bootstrap = sdl2
 
-# Useful logs
-android.logcat_filters = Python:V,ActivityManager:I,WindowManager:I
 
 # Security
 android.allow_backup = False
@@ -98,6 +106,3 @@ log_level = 2
 warn_on_root = 1
 build_dir = .buildozer
 android.accept_sdk_license = True
-
-
-

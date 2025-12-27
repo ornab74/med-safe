@@ -59,9 +59,7 @@ android.add_src = android_src
 
 # IMPORTANT:
 # Must be a SINGLE LINE, otherwise buildozer may misinterpret it as a filename and try to open() it.
-android.extra_manifest_application_arguments = <receiver android:name="com.medsafe.medsafellm.AlarmReceiver" android:exported="false" /><receiver android:name="com.medsafe.medsafellm.BootReceiver" android:exported="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" /></intent-filter></receiver>
-
-# ----------------------------
+android.extra_manifest_application_arguments = '<receiver android:name="com.medsafe.medsafellm.AlarmReceiver" android:exported="false" /><receiver android:name="com.medsafe.medsafellm.BootReceiver" android:exported="false"><intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /><action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" /></intent-filter></receiver>'
 # Android services (optional)
 # ----------------------------
 # If you switch to AlarmManager-only reminders, remove this line AND remove FOREGROUND_SERVICE permission.

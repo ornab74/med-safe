@@ -1,6 +1,6 @@
 [app]
 # ----------------------------
-# MedSafe — Buildozer config (updated for AlarmManager + version bump)
+# MedSafe — Buildozer config (WORKING for AlarmManager + inline Java generation)
 # ----------------------------
 
 title = MedSafe
@@ -13,17 +13,14 @@ source.dir = .
 source.main = main.py
 
 # Human version + monotonically increasing version_code
-version = 0.1.22
-android.version_code = 203746224
+# (bumped)
+version = 0.1.23
+android.version_code = 203746225
 
 # ----------------------------
 # Python / deps
 # ----------------------------
-# NOTE:
-
-
 requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
-
 p4a.local_recipes = ./p4a_recipes
 
 # ----------------------------
@@ -35,7 +32,11 @@ fullscreen = 0
 # ----------------------------
 # Assets / includes
 # ----------------------------
-# Include android_src if you're adding Java receivers + manifest injection.
+# IMPORTANT:
+# Build failed because android_src/extra_manifest.xml didn't exist.
+# This spec assumes you either:
+#   (A) COMMIT android_src/ into your repo (recommended), OR
+#   (B) run: python main.py --gen-android  BEFORE buildozer runs (CI step).
 include_patterns =
     *.py,
     *.kv,
@@ -46,35 +47,28 @@ include_patterns =
 # ----------------------------
 # Android permissions
 # ----------------------------
-# Existing:
 # - INTERNET for downloads
-# - FOREGROUND_SERVICE if you actually run a foreground sticky service
 # - POST_NOTIFICATIONS for Android 13+
-#
-# AlarmManager persistence:
+# - FOREGROUND_SERVICE only if you truly use a foreground service
 # - SCHEDULE_EXACT_ALARM for exact alarms
 # - RECEIVE_BOOT_COMPLETED to resync after reboot
-# - WAKE_LOCK/VIBRATE nice-to-have for reliable UX
-#
-# (Android 15 is API 35) 1
-android.permissions = INTERNET, POST_NOTIFICATIONS, FOREGROUND_SERVICE, SCHEDULE_EXACT_ALARM, RECEIVE_BOOT_COMPLETED, WAKE_LOCK, VIBRATE
+# - WAKE_LOCK/VIBRATE optional
+android.permissions = INTERNET,POST_NOTIFICATIONS,FOREGROUND_SERVICE,SCHEDULE_EXACT_ALARM,RECEIVE_BOOT_COMPLETED,WAKE_LOCK,VIBRATE
 
 # ----------------------------
-# Android Java sources + manifest injection (for AlarmReceiver/BootReceiver)
+# Android Java sources + manifest injection (AlarmReceiver/BootReceiver)
 # ----------------------------
-# Your main.py --gen-android should create:
-#   android_src/<com>/<medsafe>/<...>.java
+# MUST exist at build time:
 #   android_src/extra_manifest.xml
-#
-# Buildozer supports adding src + extra manifest injection. 
+#   android_src/com/medsafe/medsafellm/AlarmReceiver.java
+#   android_src/com/medsafe/medsafellm/BootReceiver.java
 android.add_src = android_src
-android.extra_manifest_xml = android_src/extra_manifest.xml
+android.extra_manifest_xml = ./android_src/extra_manifest.xml
 
 # ----------------------------
-# Android services (background reminders)
+# Android services (optional)
 # ----------------------------
-# If you SWITCH to AlarmManager-only reminders, you can remove the service line
-# and drop FOREGROUND_SERVICE permission.
+# If you switch to AlarmManager-only reminders, remove this line AND remove FOREGROUND_SERVICE permission.
 services = medservice:service/med_service.py:foreground:sticky
 
 # ----------------------------
@@ -82,20 +76,17 @@ services = medservice:service/med_service.py:foreground:sticky
 # ----------------------------
 android.sdk_path = /usr/local/lib/android/sdk
 
-# API 35 == Android 15 3
-# NOTE: Some people hit build issues when pushing very new APIs/toolchains; if you hit that,
-# drop android.api to 34 while keeping minapi. 4
+# If API 35 causes toolchain pain in CI, drop to 34 first.
 android.api = 35
 android.minapi = 23
 android.ndk_api = 23
-
 android.build_tools_version = 35.0.0
 
-# Target arch
 android.archs = arm64-v8a
-
 p4a.bootstrap = sdl2
 
+# Useful logs (optional)
+android.logcat_filters = Python:V,ActivityManager:I,WindowManager:I
 
 # Security
 android.allow_backup = False

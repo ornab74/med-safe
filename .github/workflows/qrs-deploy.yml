@@ -13,10 +13,6 @@ jobs:
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROIDSDK: /usr/local/lib/android/sdk
-
-      GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8'
-      JAVA_TOOL_OPTIONS: -Xmx4096m
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +36,7 @@ jobs:
             libgdbm-dev libnss3-dev libreadline-dev \
             liblzma-dev libjpeg-dev libfreetype6-dev
 
-      - name: Install Android SDK cmdline-tools
+      - name: Install Android SDK
         run: |
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
           cd "$ANDROID_SDK_ROOT/cmdline-tools"
@@ -53,20 +49,21 @@ jobs:
           echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
           echo "$ANDROID_SDK_ROOT/tools/bin" >> $GITHUB_PATH
 
-      - name: Install Android packages (API 35)
+      - name: Install Android packages
         run: |
-          sdkmanager --version
+          sdkmanager --version || true
           yes | sdkmanager --licenses || true
           sdkmanager \
             "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+            "platforms;android-34" \
+            "build-tools;34.0.0"
 
       - name: Install Buildozer & Python deps
         run: |
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
-          pip install buildozer cryptography
+          pip install buildozer
+          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'
@@ -82,10 +79,15 @@ jobs:
           P4A_RELEASE_KEYSTORE_PASSWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           P4A_RELEASE_KEYALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           P4A_RELEASE_KEYALIAS_PASSWD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: buildozer -v android release
+        run: |
+          buildozer -v android release
+          ls -lah bin
 
       - name: Build debug APK
-        run: buildozer -v android debug
+        if: github.event_name == 'pull_request'
+        run: |
+          buildozer android debug
+          ls -lah bin
 
       - name: Upload RELEASE AAB
         if: github.event_name != 'pull_request'
@@ -93,10 +95,4 @@ jobs:
         with:
           name: QRS-Android-AAB
           path: bin/*.aab
-
-      - name: Upload DEBUG APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: QRS-Android-APK
-          path: bin/*.apk
-
+          if-no-files-found: error

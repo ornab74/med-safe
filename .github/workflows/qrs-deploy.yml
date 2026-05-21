@@ -63,7 +63,7 @@ jobs:
           python -m pip install --upgrade pip wheel setuptools
           pip install "Cython<3.0"
           pip install buildozer
-          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite psutil pennylane
+          pip install kivy==2.2.1 kivymd httpx cryptography aiosqlite litert-lm
 
       - name: Restore signing keystore
         if: github.event_name != 'pull_request'

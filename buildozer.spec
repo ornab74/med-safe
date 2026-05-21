@@ -13,9 +13,8 @@ version = 0.1.1
 
 android.version_code = 1024001
 
-requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,psutil,pennylane,llama_cpp_python
+requirements = python3,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,litert-lm
 
-p4a.local_recipes = ./p4a_recipes
 
 orientation = portrait
 fullscreen = 0

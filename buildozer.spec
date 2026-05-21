@@ -1,8 +1,8 @@
 [app]
 
-title = MedSafe
-package.name = medsafe
-package.domain = com.medsafe
+title = Safe
+package.name = lightcal
+package.domain = com.qroadscan
 
 source.dir = .
 source.main = main.py

@@ -27,7 +27,7 @@ android.sdk_path = /usr/local/lib/android/sdk
 
 android.api = 35
 android.minapi = 26
-android.ndk_api = 26
+android.ndk_api = 27c
 
 android.build_tools_version = 35.0.0
 

@@ -13,8 +13,8 @@ android.version_code = 1024005
 # ==================== CRITICAL FIXES ====================
 python.version = 3.11
 
-# Must match hostpython3 exactly
-requirements = python3==3.11,hostpython3==3.11,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,litert-lm
+# Use a valid full version that exists on GitHub
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy==2.2.1,kivymd,httpx,cryptography,aiosqlite,litert-lm
 
 orientation = portrait
 fullscreen = 0
